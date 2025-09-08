@@ -18,9 +18,9 @@ This short guide explains what each feature does, when to use it, and how to set
 - When to use: You want distinct subjects/styles per area (e.g., skylines vs. foreground flowers) in one image.
 - How to use:
   1. Encode your base prompt (positive/negative) as usual.
-  2. Add "Regional Conditioning (Illustrious)".
-  3. Connect: CLIP, base CONDITIONING, and the LATENT (for sizing masks).
-  4. Create regions using nodes:
+  1. Add "Regional Conditioning (Illustrious)".
+  1. Connect: CLIP, base CONDITIONING, and the LATENT (for sizing masks).
+  1. Create regions using nodes:
   - "Empty Regions (Illustrious)" → one or more "Make Region (Illustrious)" → chain with "Append Region (Illustrious)"
   - Connect the resulting ILLUSTRIOUS_REGIONS to the "regions" input of Regional Conditioning.
   1. Pipe the Regional Conditioning output CONDITIONING to your sampler.
