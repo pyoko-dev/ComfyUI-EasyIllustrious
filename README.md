@@ -16,6 +16,7 @@ A comprehensive node suite for ComfyUI optimized for Illustrious XL models, feat
 - **Smart prompt construction**: Chainable prompt nodes with automatic formatting and optimization
 - **Unified color pipeline**: Integrated color correction with live preview and smart caching
 - **Complete node ecosystem**: CLIP encoders, latent manipulation, VAE operations, attention coupling, and more
+- **Mask-scoped guidance**: Regional prompting via masks with per-region weights and schedule, plus inpainting/outpainting tools
 
 > [!Note]
 > This suite is designed primarily for Illustrious XL models. Other SDXL-based models are supported but may require parameter adjustments.
@@ -28,11 +29,38 @@ A comprehensive node suite for ComfyUI optimized for Illustrious XL models, feat
 
 ![Node Interface](nodes.jpg)
 
+## Inpainting vs Regional Prompting (what to use and when)
+
+Artist-friendly guide for picking the right tool:
+
+- Inpainting (VAE Encode → mode: inpaint)
+    - Limits changes to a mask. Optionally pre-fills the masked area from a reference image before sampling.
+    - Use when you want to fix/replace part of an image without altering the rest (hands, face, background patch).
+    - How: Set VAE Encode to inpaint, connect your mask (white = change), optionally connect a reference image.
+
+- Regional Prompting (IllustriousRegionalConditioning)
+    - Applies different prompts to specific areas via masks, with weights and time ranges (start/end 0–1).
+    - Use when you want different concepts/styles in different parts of one image (e.g., sky: sunset; foreground: flowers).
+    - How: Build your base prompt as usual, add Regional Conditioning, wire masks + prompts, then feed its CONDITIONING to your sampler.
+
+Tips
+
+- You do NOT need VAE “regional” mode to use Regional Conditioning. Keep VAE in “standard” unless you’re explicitly inpainting.
+- Feather (blur) your masks for smooth blending; hard edges can look cut out.
+- Illustrious models prefer moderate CFG (≈5) and sensible steps; add steps for complex multi-region prompts.
+
+Auto Outpaint
+
+- Illustrious Auto Outpaint builds its own border mask and handles sampling; VAE “regional” is not required for it.
+- To mix outpainting with regional prompts: either outpaint first, then run a second pass with Regional Conditioning; or build a manual outpaint chain and insert Regional Conditioning before sampling.
+
+Full guide: web/docs/guides/inpainting_and_regional.md
+
 ## Architecture
 
 ### Core Components
 
-**Prompt/Content Generation**
+### Prompt/Content Generation
 - Base Model (IllustriousMasterModel)
 - Prompt Builder (IllustriousPrompt) 
 - Character/Artist Selectors (IllustriousCharacters, IllustriousArtists)
@@ -40,19 +68,19 @@ A comprehensive node suite for ComfyUI optimized for Illustrious XL models, feat
 - Style Components (Hairstyles, Clothing, Poses)
 - Pony Token Compatibility Layer
 
-**Sampling/Scheduling**
+### Sampling/Scheduling
 - KSampler Pro with Illustrious optimizations
 - Preset-based KSampler for rapid prototyping
 - Multi-Pass and Triple-Pass sampling architectures
 - Custom scheduler with content-aware noise patterns
 
-**Encoding/Latent Operations**
+### Encoding/Latent Operations
 - Illustrious-tuned CLIP text encoders (positive/negative)
 - Empty latent generation with model-aware sizing
 - Latent upscaling with intelligent interpolation
 - VAE encode/decode with tiling support
 
-**Utilities/Post-processing**
+### Utilities/Post-processing
 - Unified Color Suite with real-time preview
 - TIPO prompt optimizer with restructuring algorithms
 - Smart Scene Generator with template system
@@ -152,6 +180,12 @@ The suite includes automatic memory management:
 | IllustriousVAEEncode | VAE Encode | Image to latent conversion with tiling support |
 | IllustriousVAEDecode | VAE Decode | Latent to image conversion with tiling support |
 
+### Conditioning Nodes
+
+| Class | Display Name | Function |
+|-------|--------------|----------|
+| IllustriousRegionalConditioning | Regional Conditioning | Adds mask-scoped prompts (weight + start/end) to the conditioning stream |
+
 ### Utility Nodes
 
 | Class | Display Name | Function |
@@ -215,17 +249,20 @@ See `example_workflows/` for complete workflow files:
 - **Node Gallery.json** - Comprehensive node showcase
 
 ### Basic Text-to-Image
-```
+
+```text
 Empty Latent → Characters → Artists → KSampler Pro → VAE Decode
 ```
 
 ### Advanced Scene Generation
-```
+
+```text
 Scene Generator → Prompt Builder → Multi-Pass Sampler → Color Suite → VAE Decode
 ```
 
 ### Style Transfer Pipeline
-```
+
+```text
 VAE Encode → Artists → KSampler Pro (low denoise) → VAE Decode
 ```
 
@@ -233,22 +270,26 @@ VAE Encode → Artists → KSampler Pro (low denoise) → VAE Decode
 
 ### Common Issues
 
-**Oversaturation/Overcooked Images**
+### Oversaturation/Overcooked Images
+
 - Reduce CFG scale to 4.0-4.5
 - Switch to karras scheduler at high resolutions
 - Enable Dynamic Thresholding in advanced settings
 
-**Soft/Foggy Images**
+### Soft/Foggy Images
+
 - Increase CFG scale to 5.5-6.5
 - Add more sampling steps (28-35)
 - Verify model is Illustrious XL compatible
 
-**Search Functionality Issues**
+### Search Functionality Issues
+
 - Ensure query length ≥ 2 characters
 - Use underscore format: "character_name"
 - Check network connectivity for database updates
 
-**Memory Issues**
+### Memory Issues
+
 - Enable Smart Cache with appropriate limits
 - Use tiled VAE for large images
 - Reduce batch sizes for high-resolution generation
@@ -283,6 +324,7 @@ Comprehensive documentation is available in the `web/docs/` directory:
 - API reference documentation
 - Workflow examples and best practices
 - Performance tuning guidelines
+- Guide: Inpainting vs Regional Prompting (artist-friendly) — web/docs/guides/inpainting_and_regional.md
 
 Each node includes embedded help accessible via the ComfyUI interface.
 
