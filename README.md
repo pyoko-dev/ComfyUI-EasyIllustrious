@@ -17,7 +17,7 @@ A comprehensive node suite for ComfyUI optimized for Illustrious XL models, feat
 - **Unified color pipeline**: Integrated color correction with live preview and smart caching
 - **Complete node ecosystem**: CLIP encoders, latent manipulation, VAE operations, attention coupling, and more
 
-> [!Note]:
+> [!Note]
 > This suite is designed primarily for Illustrious XL models. Other SDXL-based models are supported but may require parameter adjustments.
 
 > [!Tip]
