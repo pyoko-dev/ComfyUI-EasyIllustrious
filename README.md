@@ -5,7 +5,7 @@ A comprehensive node suite for ComfyUI optimized for Illustrious XL models, feat
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-Custom%20Nodes-4a90e2)](https://github.com/comfyanonymous/ComfyUI)
 [![Model: Illustrious XL](https://img.shields.io/badge/Model-Illustrious%20XL-ff69b4)](https://civitai.com/models)
-[![Status: Active](https://img.shields.io/badge/Status-Active-success)](https://github.com/regiellis/ComfyUI-EasyIllustrious)
+[![Status: Beta](https://img.shields.io/badge/Status-Beta-orange)](https://github.com/regiellis/ComfyUI-EasyIllustrious)
 [![ComfyUI Manager](https://img.shields.io/badge/ComfyUI%20Manager-Available-4a90e2)](https://github.com/ltdrdata/ComfyUI-Manager)
 
 ## Features
@@ -22,6 +22,9 @@ A comprehensive node suite for ComfyUI optimized for Illustrious XL models, feat
 
 > [!Tip]
 > Easiest install: Use ComfyUI Manager. Open Manager, search for "EasyIllustrious", click Install, then restart ComfyUI.
+
+> [!Warning]
+> Beta notice: This suite is under active development. Some nodes may require tuning and some may not work correctly across all setups. Interfaces and defaults may change between releases.
 
 ![Node Interface](nodes.jpg)
 
@@ -77,8 +80,6 @@ The suite includes JavaScript-based UI improvements loaded from `web/js/`:
 
 Notes
 
-- If you don't see it immediately, click Refresh/Reload in Manager and try again.
-- Updates are delivered via Manager; use the Update button when available.
 
 ### Manual Installation
 
@@ -92,16 +93,8 @@ pip install -r ComfyUI-EasyIllustrious/requirements.txt
 ### Dependencies
 
 Required Python packages:
-- `inquirer` - Interactive CLI components
-- `tqdm` - Progress bar utilities
-- `colorama` - Terminal color output
-- `psutil` - System resource monitoring
 
 ## Configuration
-
-### Recommended Settings for Illustrious XL
-
-**Sampling Parameters**
 - CFG Scale: 4.0-6.5 (optimal: 5.0)
 - Steps: 24-28 for standard resolution, 30+ for high-resolution
 - Sampler: euler_ancestral (balanced) or DPM++ 2M Karras (smooth)
@@ -281,19 +274,6 @@ VAE Encode → Artists → KSampler Pro (low denoise) → VAE Decode
 - Use type hints for all function signatures  
 - Document all public APIs with docstrings
 - Maintain backward compatibility for existing workflows
-
-### Testing
-
-```bash
-# Run unit tests
-python -m pytest tests/
-
-# Run integration tests
-python -m pytest tests/integration/
-
-# Run performance benchmarks
-python -m pytest tests/performance/ --benchmark
-```
 
 ## Documentation
 
