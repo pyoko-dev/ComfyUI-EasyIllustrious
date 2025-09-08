@@ -1037,6 +1037,8 @@ class IllustriousVAEEncode:
                 "vae": ("VAE", {"tooltip": "Variational Autoencoder used to encode images."}),
             },
             "optional": {
+                # Mode: standard, inpaint (mask + optional reference), regional (pass mask downstream)
+                "mode": (["standard", "inpaint", "regional"], {"default": "standard", "tooltip": "Encoding mode. Inpaint uses a mask and optional reference image; Regional forwards mask for downstream guidance."}),
                 "illustrious_version": (
                     ["auto", "v0.1", "v1.0", "v1.1", "v2.0"],
                     {"default": "auto", "tooltip": "Auto-detect from image size; choose specific to nudge prep."},
@@ -1053,6 +1055,11 @@ class IllustriousVAEEncode:
                 "overlap": ("INT", {"default": 64, "min": 32, "max": 128, "step": 16, "tooltip": "Overlap between tiles to hide seams."}),
                 "prepare_for_illustrious": ("BOOLEAN", {"default": True, "tooltip": "Apply minor tweaks before encode for Illustrious."}),
                 "enhance_for_anime": ("BOOLEAN", {"default": True, "tooltip": "Light enhancement that suits anime/illustration."}),
+                # Inpainting/regional inputs
+                "mask": ("MASK", {"tooltip": "White = region to affect. Will be downscaled to latent size and used as noise mask."}),
+                "reference_image": ("IMAGE", {"tooltip": "Optional reference image to fill masked area prior to sampling (inpaint mode)."}),
+                "mask_blur": ("INT", {"default": 4, "min": 0, "max": 64, "step": 1, "tooltip": "Feather mask edges (pixels)."}),
+                "mask_dilate": ("INT", {"default": 2, "min": 0, "max": 64, "step": 1, "tooltip": "Grow mask (pixels) before blur."}),
             },
         }
 
@@ -1065,6 +1072,7 @@ class IllustriousVAEEncode:
         self,
         pixels,
         vae,
+    mode="standard",
         illustrious_version="auto",
         optimization_mode="auto",
         enable_tiling=True,
@@ -1072,6 +1080,10 @@ class IllustriousVAEEncode:
         overlap=64,
         prepare_for_illustrious=True,
         enhance_for_anime=True,
+    mask=None,
+    reference_image=None,
+    mask_blur=4,
+    mask_dilate=2,
     ):
 
         # Auto-detect version from image characteristics
@@ -1100,12 +1112,137 @@ class IllustriousVAEEncode:
         if prepare_for_illustrious:
             latent = self.post_process_latent(latent, illustrious_version)
 
+        # Optional inpaint/regional handling: prepare noise mask and optional reference composition
+        try:
+            if mode in ("inpaint", "regional") and mask is not None:
+                mask_img = self._ensure_mask_image_space(mask, pixels)
+                mask_img = self._refine_mask(mask_img, blur_px=int(mask_blur), dilate_px=int(mask_dilate)) if (mask_blur or mask_dilate) else mask_img
+                # Downscale to latent resolution (B,1,H/8,W/8)
+                b, ih, iw, _ = pixels.shape
+                lh, lw = ih // 8, iw // 8
+                mask_latent = torch.nn.functional.interpolate(
+                    mask_img, size=(lh, lw), mode="bilinear", align_corners=False
+                )
+                mask_latent = torch.clamp(mask_latent, 0.0, 1.0)
+
+                # Compose with reference image in masked area for inpaint mode (latent space)
+                if mode == "inpaint" and reference_image is not None:
+                    # Encode reference (match strategy used for main image)
+                    if should_tile:
+                        ref_latent = self.tiled_encode(reference_image, vae, tile_size, overlap, optimization_mode)
+                    else:
+                        ref_latent = self.standard_encode(reference_image, vae, optimization_mode)
+                    ref_samples = ref_latent["samples"].to(latent["samples"].device)
+
+                    # Broadcast mask to 4 channels for NCHW samples
+                    mask_b = mask_latent.to(ref_samples.device)
+                    if mask_b.dim() == 4 and mask_b.shape[1] != 1:
+                        # If mask came as NHWC, transpose to NCHW 1-channel
+                        # We expect mask_b as [B,1,H,W]
+                        pass
+                    # Ensure mask is [B,1,H,W]
+                    if mask_b.shape[1] != 1:
+                        # If shape is [B,H,W,1] -> permute
+                        if mask_b.dim() == 4 and mask_b.shape[-1] == 1:
+                            mask_b = mask_b.permute(0, 3, 1, 2).contiguous()
+                        else:
+                            mask_b = mask_b.mean(dim=1, keepdim=True) if mask_b.dim() == 4 else mask_b.unsqueeze(1)
+                    # Compose in latent: base*(1-m)+ref*m
+                    base = latent["samples"].to(ref_samples.device)
+                    m4 = mask_b
+                    if m4.shape[2:] != base.shape[2:]:
+                        m4 = torch.nn.functional.interpolate(m4, size=base.shape[2:], mode="bilinear", align_corners=False)
+                    m4c = m4.expand(-1, base.shape[1], -1, -1)
+                    composed = base * (1.0 - m4c) + ref_samples * m4c
+                    latent["samples"] = composed
+
+                # Attach noise_mask to latent dict for downstream samplers (common_ksampler-compatible)
+                # Ensure mask is NCHW [B,1,H,W]
+                noise_mask = mask_latent
+                if noise_mask.dim() == 4 and noise_mask.shape[-1] == 1:
+                    noise_mask = noise_mask.permute(0, 3, 1, 2).contiguous()
+                if noise_mask.dim() == 3:
+                    noise_mask = noise_mask.unsqueeze(1)
+                latent["noise_mask"] = torch.clamp(noise_mask, 0.0, 1.0)
+        except Exception as e:
+            print(f"[IllustriousVAEEncode] Inpaint/Regional mask handling failed: {e}")
+
         # Generate encode info
         encode_info = self.generate_encode_info(
             method, pixels.shape, illustrious_version
         )
+        if mode in ("inpaint", "regional") and mask is not None:
+            encode_info += f"Mode: {mode} (mask applied)\n"
+        elif mode in ("inpaint", "regional"):
+            encode_info += f"Mode: {mode} (no mask provided)\n"
 
         return (latent, encode_info)
+
+    # ----- Mask helpers -----
+    def _ensure_mask_image_space(self, mask, pixels):
+        """Return mask as image-space float tensor [B,1,H,W] matching pixels batch/size.
+        Accepts MASK tensors from ComfyUI in common shapes.
+        """
+        # Pixels: [B,H,W,C]
+        b, h, w, c = pixels.shape
+        device = pixels.device if hasattr(pixels, 'device') else None
+        # Convert mask to torch tensor on same device
+        m = mask
+        try:
+            if not torch.is_tensor(m):
+                m = torch.tensor(m)
+        except Exception:
+            pass
+        if device is not None and hasattr(m, 'to'):
+            m = m.to(device=device, dtype=torch.float32)
+        else:
+            m = m.float() if hasattr(m, 'float') else m
+
+        # Normalize shape to [B,1,H,W]
+        if m.dim() == 2:
+            m = m.unsqueeze(0).unsqueeze(0)
+        elif m.dim() == 3:
+            # Could be [H,W,1] or [1,H,W]
+            if m.shape[-1] == 1:
+                m = m.permute(2, 0, 1).unsqueeze(0)  # -> [1,1,H,W]
+            else:
+                m = m.unsqueeze(0)  # assume [1,H,W]
+                if m.shape[1] != 1:
+                    m = m[:, :1, :, :]
+        elif m.dim() == 4:
+            # Could be [B,H,W,1] or [B,1,H,W]
+            if m.shape[-1] == 1:
+                m = m.permute(0, 3, 1, 2).contiguous()
+            elif m.shape[1] != 1:
+                m = m[:, :1, :, :]
+
+        # Match batch/size
+        if m.shape[0] != b:
+            if m.shape[0] == 1:
+                m = m.expand(b, -1, -1, -1).clone()
+            else:
+                m = m[:b]
+        if m.shape[2] != h or m.shape[3] != w:
+            m = torch.nn.functional.interpolate(m, size=(h, w), mode="bilinear", align_corners=False)
+
+        # Clamp 0..1
+        m = torch.clamp(m, 0.0, 1.0)
+        return m
+
+    def _refine_mask(self, mask_bchw, blur_px=0, dilate_px=0):
+        """Simple morphological refine on [B,1,H,W] masks using max/avg pooling approximations."""
+        m = mask_bchw
+        if dilate_px and dilate_px > 0:
+            k = max(1, int(dilate_px))
+            # Use max pool as dilation
+            pad = k // 2
+            m = torch.nn.functional.max_pool2d(m, kernel_size=k, stride=1, padding=pad)
+        if blur_px and blur_px > 0:
+            k = max(1, int(blur_px) | 1)  # make odd
+            pad = k // 2
+            weight = torch.ones((1, 1, k, k), device=m.device, dtype=m.dtype) / float(k * k)
+            m = torch.nn.functional.conv2d(m, weight, padding=pad)
+        return torch.clamp(m, 0.0, 1.0)
 
     def detect_version_from_image(self, pixels):
         """Auto-detect optimal Illustrious version from image characteristics."""
