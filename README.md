@@ -41,7 +41,9 @@ Artist-friendly guide for picking the right tool:
 - Regional Prompting (IllustriousRegionalConditioning)
     - Applies different prompts to specific areas via masks, with weights and time ranges (start/end 0–1).
     - Use when you want different concepts/styles in different parts of one image (e.g., sky: sunset; foreground: flowers).
-    - How: Build your base prompt as usual, add Regional Conditioning, wire masks + prompts, then feed its CONDITIONING to your sampler.
+    - How: Build your base prompt as usual, then create regions with:
+        - "□ Empty Regions (Illustrious)" → one or more "＋ Make Region (Illustrious)" → chain via "→ Append Region (Illustrious)"
+        - Connect the resulting ILLUSTRIOUS_REGIONS to the "regions" input of "⌦ Regional Conditioning (Illustrious)", then feed its CONDITIONING to your sampler.
 
 Tips
 
@@ -61,26 +63,30 @@ Full guide: web/docs/guides/inpainting_and_regional.md
 ### Core Components
 
 ### Prompt/Content Generation
+
 - Base Model (IllustriousMasterModel)
-- Prompt Builder (IllustriousPrompt) 
+- Prompt Builder (IllustriousPrompt)
 - Character/Artist Selectors (IllustriousCharacters, IllustriousArtists)
 - E621 Character/Artist Variants
 - Style Components (Hairstyles, Clothing, Poses)
 - Pony Token Compatibility Layer
 
 ### Sampling/Scheduling
+
 - KSampler Pro with Illustrious optimizations
 - Preset-based KSampler for rapid prototyping
 - Multi-Pass and Triple-Pass sampling architectures
 - Custom scheduler with content-aware noise patterns
 
 ### Encoding/Latent Operations
+
 - Illustrious-tuned CLIP text encoders (positive/negative)
 - Empty latent generation with model-aware sizing
 - Latent upscaling with intelligent interpolation
 - VAE encode/decode with tiling support
 
 ### Utilities/Post-processing
+
 - Unified Color Suite with real-time preview
 - TIPO prompt optimizer with restructuring algorithms
 - Smart Scene Generator with template system
@@ -123,20 +129,23 @@ pip install -r ComfyUI-EasyIllustrious/requirements.txt
 Required Python packages:
 
 ## Configuration
+
 - CFG Scale: 4.0-6.5 (optimal: 5.0)
 - Steps: 24-28 for standard resolution, 30+ for high-resolution
 - Sampler: euler_ancestral (balanced) or DPM++ 2M Karras (smooth)
 - Scheduler: normal (standard), karras (1536px+)
 
-**Resolution Guidelines**
+Resolution Guidelines
+
 - Training resolution: 1024x1024
-- Portrait: 832x1216 
+- Portrait: 832x1216
 - Landscape: 1216x832
 - Widescreen: 1344x768
 
 ### Memory Optimization
 
 The suite includes automatic memory management:
+
 - Dynamic batch size adjustment based on VRAM
 - Intelligent model loading with fallback options  
 - Smart caching with LRU eviction policies
@@ -185,6 +194,9 @@ The suite includes automatic memory management:
 | Class | Display Name | Function |
 |-------|--------------|----------|
 | IllustriousRegionalConditioning | Regional Conditioning | Adds mask-scoped prompts (weight + start/end) to the conditioning stream |
+| IllustriousMakeRegion | Make Region | Build a single region (mask + prompt + weight + start/end) |
+| IllustriousEmptyRegions | Empty Regions | Start an empty regions list to collect regions |
+| IllustriousAppendRegion | Append Region | Append a region to a regions list (chain for unlimited regions) |
 
 ### Utility Nodes
 
@@ -211,6 +223,7 @@ GET /illustrious/search/artists?q={query}&limit={n}
 ```
 
 Response format:
+
 ```json
 {
     "results": [

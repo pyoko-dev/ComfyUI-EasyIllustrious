@@ -12,7 +12,12 @@ from .src.nodes import (
     latent as _latent,
 )
 from .src.nodes.vae import IllustriousVAEDecode, IllustriousVAEEncode
-from .src.nodes.illustrious_regional_conditioning import IllustriousRegionalConditioning
+from .src.nodes.illustrious_regional_conditioning import (
+    IllustriousRegionalConditioning,
+    IllustriousMakeRegion,
+    IllustriousEmptyRegions,
+    IllustriousAppendRegion,
+)
 from .src.nodes.tipo_optimizer import TIPOPromptOptimizer
 from .src.nodes.attention_couple import IllustriousAttentionCouple
 from .src.core import anime_scene_system as _anime
@@ -84,6 +89,9 @@ NODE_CLASS_MAPPINGS = {
     "IllustriousVAEDecode": IllustriousVAEDecode,
     "IllustriousVAEEncode": IllustriousVAEEncode,
     "IllustriousRegionalConditioning": IllustriousRegionalConditioning,
+    "IllustriousMakeRegion": IllustriousMakeRegion,
+    "IllustriousEmptyRegions": IllustriousEmptyRegions,
+    "IllustriousAppendRegion": IllustriousAppendRegion,
     # (image comparer removed)
     "TIPOPromptOptimizer": TIPOPromptOptimizer,
     "IllustriousScenesPlus": IllustriousScenesPlusEngine,
@@ -120,6 +128,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "IllustriousVAEDecode": "◀ VAE Decode (Illustrious)",
     "IllustriousVAEEncode": "▶ VAE Encode (Illustrious)",
     "IllustriousRegionalConditioning": "⌦ Regional Conditioning (Illustrious)",
+    "IllustriousMakeRegion": "＋ Make Region (Illustrious)",
+    "IllustriousEmptyRegions": "□ Empty Regions (Illustrious)",
+    "IllustriousAppendRegion": "→ Append Region (Illustrious)",
     "IllustriousSmartSceneGenerator": "✦ Smart Scene Generator",
     # (image comparer removed)
     "TIPOPromptOptimizer": "◆ TIPO Prompt Optimizer",

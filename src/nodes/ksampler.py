@@ -120,7 +120,11 @@ class IllustriousKSamplerPro:
                            sigmas=None):
         args=(model,int(seed),int(steps),float(cfg),sampler_name,scheduler,positive,negative,latent_dict)
         ks_params=self._ksampler_params(); kwargs={"denoise":float(denoise)}
-        if noise_mask is not None and "noise_mask" in ks_params: kwargs["noise_mask"]=noise_mask
+        if noise_mask is not None:
+            if "denoise_mask" in ks_params:
+                kwargs["denoise_mask"] = noise_mask
+            elif "noise_mask" in ks_params:
+                kwargs["noise_mask"] = noise_mask
         if disable_noise is not None and "disable_noise" in ks_params: kwargs["disable_noise"]=bool(disable_noise)
         # Wire through sigmas if supported by this ComfyUI build
         if sigmas is not None and "sigmas" in ks_params:
@@ -155,8 +159,25 @@ class IllustriousKSamplerPro:
         adv_logs=kw.get("Advanced Logs",False)
 
         device=model_management.get_torch_device()
-        latent=latent_image["samples"].to(device=device)
-        h,w=latent.shape[2]*8,latent.shape[3]*8
+        # Preserve full latent dict (samples, noise_mask, etc.) and move tensors to device
+        latent_in = dict(latent_image) if isinstance(latent_image, dict) else {"samples": latent_image}
+        latent = latent_in.get("samples")
+        if isinstance(latent, torch.Tensor):
+            latent = latent.to(device=device)
+        else:
+            raise TypeError("latent_image['samples'] must be a torch.Tensor")
+        # Ensure noise_mask (if present) is on device and clamped
+        nm = latent_in.get("noise_mask", None)
+        if isinstance(nm, torch.Tensor):
+            nm = nm.to(device=device)
+            try:
+                nm = nm.clamp(0.0, 1.0)
+            except Exception:
+                pass
+            latent_in["noise_mask"] = nm
+        # Update samples tensor in the latent dict after moving to device
+        latent_in["samples"] = latent
+        h,w = latent.shape[2]*8, latent.shape[3]*8
 
         sampler_name=self._normalize_sampler(sampler_name)
         if scheduler=="normal": scheduler="karras"
@@ -177,19 +198,25 @@ class IllustriousKSamplerPro:
             print(f"[IllustriousKSamplerPro] v={mv} res={w}x{h} steps={steps} cfg={cfg:.2f} "
                   f"sampler={sampler_name}/{scheduler} denoise={denoise} seed={final_seed}")
 
-        latent_in={"samples":latent}
+        # If we will pass mask via kwargs, drop any mask keys from latent dict to avoid duplication
+        if nm is not None:
+            try:
+                latent_in.pop("noise_mask", None)
+                latent_in.pop("denoise_mask", None)
+            except Exception:
+                pass
         # Choose schedule if provided
         effective_sigmas = sigmas
         if effective_sigmas is not None:
             sampled=self._call_core_sampler(
                 model,final_seed,steps,cfg,sampler_name,scheduler,
-                positive,negative,latent_in,denoise,noise_mask=None,disable_noise=None,
+        positive,negative,latent_in,denoise,noise_mask=nm,disable_noise=None,
                 sigmas=effective_sigmas
             )
         else:
             sampled=self._call_core_sampler(
                 model,final_seed,steps,cfg,sampler_name,scheduler,
-                positive,negative,latent_in,denoise
+        positive,negative,latent_in,denoise,noise_mask=nm
             )
         return (sampled,model,positive,negative)
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import List
 import torch
 
 
@@ -24,36 +24,8 @@ class IllustriousRegionalConditioning:
                 "mask_dilate": ("INT", {"default": 2, "min": 0, "max": 64, "step": 1}),
             },
             "optional": {
-                # Up to 6 regions (expand as needed)
-                "mask_1": ("MASK", {}), "prompt_1": ("STRING", {"multiline": True}),
-                "weight_1": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.05}),
-                "start_1": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "end_1":   ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-
-                "mask_2": ("MASK", {}), "prompt_2": ("STRING", {"multiline": True}),
-                "weight_2": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.05}),
-                "start_2": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "end_2":   ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-
-                "mask_3": ("MASK", {}), "prompt_3": ("STRING", {"multiline": True}),
-                "weight_3": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.05}),
-                "start_3": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "end_3":   ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-
-                "mask_4": ("MASK", {}), "prompt_4": ("STRING", {"multiline": True}),
-                "weight_4": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.05}),
-                "start_4": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "end_4":   ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-
-                "mask_5": ("MASK", {}), "prompt_5": ("STRING", {"multiline": True}),
-                "weight_5": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.05}),
-                "start_5": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "end_5":   ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-
-                "mask_6": ("MASK", {}), "prompt_6": ("STRING", {"multiline": True}),
-                "weight_6": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.05}),
-                "start_6": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "end_6":   ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                # Unlimited regions via builder nodes
+                "regions": ("ILLUSTRIOUS_REGIONS", {"tooltip": "Optional list of regions built via region builder nodes."}),
             },
         }
 
@@ -101,35 +73,36 @@ class IllustriousRegionalConditioning:
         m = torch.nn.functional.interpolate(m, size=latent_hw, mode="bilinear", align_corners=False)
         return torch.clamp(m, 0.0, 1.0)
 
-    def _collect_regions(self, kwargs):
-        regions = []
-        for i in range(1, 7):
-            mk = kwargs.get(f"mask_{i}", None)
-            pk = kwargs.get(f"prompt_{i}", None)
-            if mk is None or pk is None or len(str(pk).strip()) == 0:
-                continue
-            regions.append((
-                mk, str(pk),
-                float(kwargs.get(f"weight_{i}", 1.0)),
-                float(kwargs.get(f"start_{i}", 0.0)),
-                float(kwargs.get(f"end_{i}", 1.0)),
-            ))
-        return regions
+    # no inline region collector anymore – use builder nodes instead
 
     # ---- main ----
     def build(self, clip, base_cond, latent,
-              normalize_overlap=True, mask_blur=4, mask_dilate=2, **region_kwargs):
+              normalize_overlap=True, mask_blur=4, mask_dilate=2, regions=None):
 
         device = latent["samples"].device
         _, _, lh, lw = latent["samples"].shape
         latent_hw = (lh, lw)
 
-        regions = self._collect_regions(region_kwargs)
+        regions_tuples = []
+        # Collect regions from builder chain if provided
+        if isinstance(regions, dict) and isinstance(regions.get("regions", None), list):
+            for r in regions["regions"]:
+                mk = r.get("mask")
+                pk = str(r.get("prompt", ""))
+                if mk is None or len(pk.strip()) == 0:
+                    continue
+                regions_tuples.append((
+                    mk, pk,
+                    float(r.get("weight", 1.0)),
+                    float(r.get("start", 0.0)),
+                    float(r.get("end", 1.0)),
+                ))
+
         cond = list(base_cond)  # shallow copy
 
         # Refine and collect masks
         refined_masks: List[torch.Tensor] = []
-        for (mask, prompt, weight, start, end) in regions:
+        for (mask, prompt, weight, start, end) in regions_tuples:
             m = self._mask_to_latent_res(mask, latent_hw, device)
             m = self._refine_mask(m, blur_px=mask_blur, dilate_px=mask_dilate)
             refined_masks.append(m)
@@ -141,19 +114,92 @@ class IllustriousRegionalConditioning:
             refined_masks = [m / denom for m in refined_masks]
 
         info_lines: List[str] = []
-        for idx, ((mask, prompt, weight, start, end), m_bchw) in enumerate(zip(regions, refined_masks), start=1):
+        for idx, ((mask, prompt, weight, start, end), m_bchw) in enumerate(zip(regions_tuples, refined_masks), start=1):
             # Encode prompt using CLIP
             tokens = clip.tokenize(prompt)
             region_cond, pooled = clip.encode_from_tokens(tokens, return_pooled=True)
 
+            # Use [B,lh,lw] mask (no channel dim) to match Comfy's area-conditioning expectations
+            mask_3d = m_bchw.squeeze(1) if m_bchw.dim() == 4 else m_bchw
             extras = {
                 "pooled_output": pooled,
-                "mask": m_bchw,  # [B,1,lh,lw]
+                "mask": mask_3d,  # [B,lh,lw]
                 "weight": float(weight),
                 "timestep_percent_range": (float(start), float(end)),
             }
             cond.append([region_cond, extras])
-            info_lines.append(f"R{idx}: w={weight:.2f}, t=[{start:.2f},{end:.2f}], prompt={prompt[:64]}{'...' if len(prompt)>64 else ''}")
+            info_lines.append(
+                f"R{idx}: w={weight:.2f}, t=[{start:.2f},{end:.2f}], prompt={prompt[:64]}{'...' if len(prompt)>64 else ''}"
+            )
 
         info = "Illustrious Regional Conditioning\n" + ("\n".join(info_lines) if info_lines else "No regions added.")
         return (cond, info)
+
+
+class IllustriousMakeRegion:
+    """Create a single region descriptor to be collected later."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "mask": ("MASK", {"tooltip": "Region mask (white = apply)."}),
+                "prompt": ("STRING", {"multiline": True}),
+                "weight": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.05}),
+                "start": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "end": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+            }
+        }
+
+    RETURN_TYPES = ("ILLUSTRIOUS_REGION",)
+    RETURN_NAMES = ("region",)
+    FUNCTION = "make"
+    CATEGORY = "Easy Illustrious / Conditioning"
+
+    def make(self, mask, prompt, weight=1.0, start=0.0, end=1.0):
+        return ({
+            "mask": mask,
+            "prompt": str(prompt),
+            "weight": float(weight),
+            "start": float(start),
+            "end": float(end),
+        },)
+
+
+class IllustriousEmptyRegions:
+    """Create an empty regions container."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {}}
+
+    RETURN_TYPES = ("ILLUSTRIOUS_REGIONS",)
+    RETURN_NAMES = ("regions",)
+    FUNCTION = "empty"
+    CATEGORY = "Easy Illustrious / Conditioning"
+
+    def empty(self):
+        return ({"regions": []},)
+
+
+class IllustriousAppendRegion:
+    """Append a region to a regions list (chain this to collect unlimited regions)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "regions": ("ILLUSTRIOUS_REGIONS", {}),
+                "region": ("ILLUSTRIOUS_REGION", {}),
+            }
+        }
+
+    RETURN_TYPES = ("ILLUSTRIOUS_REGIONS",)
+    RETURN_NAMES = ("regions",)
+    FUNCTION = "append"
+    CATEGORY = "Easy Illustrious / Conditioning"
+
+    def append(self, regions, region):
+        out = {"regions": list(regions.get("regions", []))}
+        out["regions"].append(region)
+        return (out,)

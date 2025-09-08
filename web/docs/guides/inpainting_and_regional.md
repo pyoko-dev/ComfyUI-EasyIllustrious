@@ -20,8 +20,10 @@ This short guide explains what each feature does, when to use it, and how to set
   1. Encode your base prompt (positive/negative) as usual.
   2. Add "Regional Conditioning (Illustrious)".
   3. Connect: CLIP, base CONDITIONING, and the LATENT (for sizing masks).
-  4. For each region: connect mask + prompt + weight + start/end (0–1).
-  5. Pipe the resulting CONDITIONING to your sampler.
+  4. Create regions using nodes:
+  - "Empty Regions (Illustrious)" → one or more "Make Region (Illustrious)" → chain with "Append Region (Illustrious)"
+  - Connect the resulting ILLUSTRIOUS_REGIONS to the "regions" input of Regional Conditioning.
+  1. Pipe the Regional Conditioning output CONDITIONING to your sampler.
 
 ## Do I need VAE "regional" mode for Regional Prompting?
 

@@ -151,6 +151,12 @@ class IllustriousMultiPassSampler:
         return self._ks_params
 
     def _run_common(self, model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_in, denoise=1.0, sigmas=None):
+        # Preserve noise_mask if present and pass using supported arg name
+        # Avoid duplication of mask in latent dict; pass via kwargs only
+        if isinstance(latent_in, dict):
+            latent_in = dict(latent_in)
+            latent_in.pop("noise_mask", None)
+            latent_in.pop("denoise_mask", None)
         args = (model, int(seed), int(steps), float(cfg), sampler_name, scheduler, positive, negative, latent_in)
         kwargs = {"denoise": float(denoise)}
         # Pass-through custom sigmas if the core supports it
@@ -158,6 +164,16 @@ class IllustriousMultiPassSampler:
             ks_params = self._ksampler_params()
         except Exception:
             ks_params = set()
+        # Wire noise mask if available
+        try:
+            nm = latent_in.get("noise_mask") if isinstance(latent_in, dict) else None
+        except Exception:
+            nm = None
+        if nm is not None:
+            if "denoise_mask" in ks_params:
+                kwargs["denoise_mask"] = nm
+            elif "noise_mask" in ks_params:
+                kwargs["noise_mask"] = nm
         if sigmas is not None and "sigmas" in ks_params:
             try:
                 if hasattr(sigmas, "detach"):
@@ -481,8 +497,27 @@ class IllustriousTriplePassSampler:
 
     # ---- common_ksampler bridge (duplicate to avoid dependency on MultiPass) ----
     def _run_common(self, model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_in, denoise=1.0):
+        # Avoid duplication of mask in latent dict; pass via kwargs only
+        if isinstance(latent_in, dict):
+            latent_in = dict(latent_in)
+            latent_in.pop("noise_mask", None)
+            latent_in.pop("denoise_mask", None)
         args = (model, int(seed), int(steps), float(cfg), sampler_name, scheduler, positive, negative, latent_in)
         kwargs = {"denoise": float(denoise)}
+        # Wire noise mask if available on this ComfyUI build
+        try:
+            ks_params = set(inspect.signature(common_ksampler).parameters.keys())
+        except Exception:
+            ks_params = set()
+        try:
+            nm = latent_in.get("noise_mask") if isinstance(latent_in, dict) else None
+        except Exception:
+            nm = None
+        if nm is not None:
+            if "denoise_mask" in ks_params:
+                kwargs["denoise_mask"] = nm
+            elif "noise_mask" in ks_params:
+                kwargs["noise_mask"] = nm
         out = common_ksampler(*args, **kwargs)
         # normalize to {"samples": tensor}
         if isinstance(out, dict) and "samples" in out and isinstance(out["samples"], torch.Tensor):

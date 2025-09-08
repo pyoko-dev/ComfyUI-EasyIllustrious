@@ -1,9 +1,9 @@
 """
 Auto Outpaint (Illustrious) — Single-node, Illustrious-first outpainting.
 
-Illustrious-tuned defaults (SDXL family), soft-mask padding + noise_mask so only
+Illustrious-tuned defaults (SDXL family), soft-mask padding + denoise_mask so only
 borders are denoised, optional two-stage growth for big expansions, optional
-refiner pass, and small scene bias hints.
+two-phase schedule (grow→refine), optional refiner pass, and seam-toning micro-pass.
 """
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from nodes import (
     VAEEncode,
     common_ksampler,
 )
+
 try:
     # Optional advanced encoder (BNK). Will be used if present.
     from nodes import BNK_CLIPTextEncodeAdvanced  # type: ignore
@@ -108,9 +109,71 @@ def _blend_keep_interior(
     """
     Blend to preserve interior (mask=0 keeps original; mask=1 uses new).
     """
-    # Ensure mask matches tensor dtype/device for safe math
     mask = mask_border_soft.to(dtype=new_latent.dtype, device=new_latent.device)
     return original_latent_padded * (1.0 - mask) + new_latent * mask
+
+
+def _rgb_to_luma(img_nhwc: torch.Tensor) -> torch.Tensor:
+    # img: [B,H,W,C] in [0,1]
+    r, g, b = img_nhwc[..., 0], img_nhwc[..., 1], img_nhwc[..., 2]
+    return (0.2126 * r + 0.7152 * g + 0.0722 * b).unsqueeze(-1)  # [B,H,W,1]
+
+
+def _seam_tone(image_nhwc: torch.Tensor, mask_lat_b1: torch.Tensor, strength: float = 0.25, feather_px_img: int = 48) -> torch.Tensor:
+    """
+    Feathered luminance/color equalization along seam. `mask_lat_b1` is [B,1,H_lat,W_lat] with 1 at border.
+    We upsample to image res and apply a gentle offset/blur only in the seam band.
+    """
+    if strength <= 0.0:
+        return image_nhwc
+
+    B, H, W, C = image_nhwc.shape
+    # Upsample mask to image-space
+    m_b1_img = F.interpolate(mask_lat_b1, size=(H, W), mode="bilinear", align_corners=False)  # [B,1,H,W]
+    m_img = m_b1_img.permute(0, 2, 3, 1).contiguous()  # [B,H,W,1]
+
+    # Build an interior-side band by inverting and blurring a bit
+    inv = 1.0 - m_b1_img
+    k = max(1, 2 * (feather_px_img // 2) + 1)
+    if k > 1:
+        # cheap separable blur to create soft bands
+        k1 = torch.ones(1, 1, k, device=image_nhwc.device, dtype=image_nhwc.dtype) / k
+        inv_blur = F.conv2d(inv, k1.view(1, 1, k, 1), padding=(k // 2, 0))
+        inv_blur = F.conv2d(inv_blur, k1.view(1, 1, 1, k), padding=(0, k // 2))
+        border_blur = F.conv2d(m_b1_img, k1.view(1, 1, k, 1), padding=(k // 2, 0))
+        border_blur = F.conv2d(border_blur, k1.view(1, 1, 1, k), padding=(0, k // 2))
+    else:
+        inv_blur = inv
+        border_blur = m_b1_img
+
+    interior_band = (inv_blur - (inv_blur > 0).float() * 0.0).clamp(0, 1)  # [B,1,H,W]
+    border_band = (border_blur - (border_blur > 0).float() * 0.0).clamp(0, 1) # [B,1,H,W]
+
+    # Compute band-wise mean colors
+    eps = 1e-6
+    img_bchw = image_nhwc.permute(0, 3, 1, 2).contiguous()  # [B,C,H,W]
+    i_sum = (img_bchw * interior_band).sum(dim=(2, 3), keepdim=True)
+    b_sum = (img_bchw * border_band).sum(dim=(2, 3), keepdim=True)
+    i_cnt = interior_band.sum(dim=(2, 3), keepdim=True).clamp_min(eps)
+    b_cnt = border_band.sum(dim=(2, 3), keepdim=True).clamp_min(eps)
+    mean_interior = i_sum / i_cnt
+    mean_border = b_sum / b_cnt
+    delta = (mean_interior - mean_border)  # [B,C,1,1]
+
+    # Apply small color/luma offset only in the seam band
+    blend_band = (border_band + interior_band).clamp(0.0, 1.0)  # [B,1,H,W]
+    blend_nhwc = blend_band.permute(0, 2, 3, 1).contiguous()  # [B,H,W,1]
+    corrected = image_nhwc + (delta.permute(0, 2, 3, 1) * blend_nhwc * strength)
+
+    # Light local blur only on seam to hide ridge artifacts
+    if k > 1:
+        blur_src = corrected.permute(0, 3, 1, 2)
+        blur = F.conv2d(blur_src, k1.view(1, 1, k, 1), padding=(k // 2, 0), groups=1)
+        blur = F.conv2d(blur, k1.view(1, 1, 1, k), padding=(0, k // 2), groups=1)
+        blur = blur.permute(0, 2, 3, 1)
+        corrected = corrected * (1.0 - 0.15 * blend_nhwc) + blur * (0.15 * blend_nhwc)
+
+    return corrected.clamp(0.0, 1.0)
 
 
 class IllustriousAutoOutpaint:
@@ -146,9 +209,18 @@ class IllustriousAutoOutpaint:
                 "feather_px": ("INT", {"default": _ILLUSTRIOUS_DEFAULTS["feather_px"], "min": 0, "max": 1024}),
                 # nice extras
                 "scene_hint": (list(_SCENE_HINTS.keys()), {"default": "none"}),
-                "two_stage_growth": ("BOOLEAN", {"default": True}),  # good for big pads
+                "two_stage_growth": ("BOOLEAN", {"default": True}),  # half-pad then full
                 # optional refiner pass
                 "use_refiner": ("BOOLEAN", {"default": False}),
+                # NEW: two-phase schedule (grow→refine)
+                "two_phase_schedule": ("BOOLEAN", {"default": False}),
+                "grow_steps_frac": ("FLOAT", {"default": 0.45, "min": 0.05, "max": 0.9, "step": 0.01}),
+                "grow_denoise": ("FLOAT", {"default": 0.90, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "refine_denoise": ("FLOAT", {"default": 0.55, "min": 0.0, "max": 1.0, "step": 0.01}),
+                # NEW: seam-toning micro-pass
+                "seam_toning": ("BOOLEAN", {"default": True}),
+                "seam_tone_strength": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "seam_feather_px": ("INT", {"default": 48, "min": 8, "max": 256, "step": 4}),
             },
             "optional": {
                 "refiner_model": ("MODEL",),     # if use_refiner=True
@@ -222,15 +294,12 @@ class IllustriousAutoOutpaint:
         args = (model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_dict)
         ks_params = self._ksampler_params()
         kwargs = {}
-        # denoise is widely supported; pass it
         kwargs["denoise"] = denoise
-        # Mask only if supported (prefer 'denoise_mask' per Comfy's KSampler)
         if noise_mask is not None:
             if "denoise_mask" in ks_params:
                 kwargs["denoise_mask"] = noise_mask
             elif "noise_mask" in ks_params:
                 kwargs["noise_mask"] = noise_mask
-        # disable_noise only if supported
         if disable_noise is not None and "disable_noise" in ks_params:
             kwargs["disable_noise"] = disable_noise
         samples = common_ksampler(*args, **kwargs)
@@ -243,7 +312,6 @@ class IllustriousAutoOutpaint:
             if isinstance(maybe, torch.Tensor):
                 tensor = maybe
         elif isinstance(samples, (list, tuple)):
-            # Prefer first tensor; otherwise look for dict with "samples"
             for it in samples:
                 if isinstance(it, torch.Tensor):
                     tensor = it
@@ -252,7 +320,6 @@ class IllustriousAutoOutpaint:
                     tensor = it["samples"]
                     break
         if tensor is None:
-            # Last resort: attribute access
             try:
                 tensor = getattr(samples, "samples")
             except Exception:
@@ -262,11 +329,9 @@ class IllustriousAutoOutpaint:
         return {"samples": tensor}
 
     def _decode(self, vae, latent_dict):
-        # VAEDecode returns a tuple; first item is IMAGE
         return VAEDecode().decode(vae, latent_dict)[0]
 
     def _encode_image_to_latent(self, vae, image):
-        # VAEEncode returns a tuple; first item is LATENT dict {"samples": tensor}
         return VAEEncode().encode(vae, image)[0]
 
     # ----------------------------- main --------------------------------------
@@ -294,22 +359,28 @@ class IllustriousAutoOutpaint:
         scene_hint,
         two_stage_growth,
         use_refiner,
+        two_phase_schedule,
+        grow_steps_frac,
+        grow_denoise,
+        refine_denoise,
+        seam_toning,
+        seam_tone_strength,
+        seam_feather_px,
         refiner_model=None,
         refiner_steps=12,
         refiner_denoise=0.22,
-    weight_interpretation="comfy",
-    token_normalization="none",
+        weight_interpretation="comfy",
+        token_normalization="none",
     ):
         device = mm.get_torch_device()
 
-        # 0) augment prompt with scene hint (tiny, non-invasive)
+        # 0) augment prompt with scene hint
         if scene_hint in _SCENE_HINTS and _SCENE_HINTS[scene_hint]:
             prompt = (prompt or "") + _SCENE_HINTS[scene_hint]
 
         # 1) encode image → latent
         lat = self._encode_image_to_latent(vae, image)
         x0 = lat["samples"].to(device)
-        B, C, h_lat, w_lat = x0.shape
 
         # 2) compute latent-side padding and feather
         pad_lat = (
@@ -324,153 +395,115 @@ class IllustriousAutoOutpaint:
         if sum(pad_lat) == 0:
             pos = self._encode_cond(clip, prompt, weight_interpretation, token_normalization)
             neg = self._encode_cond(clip, negative, weight_interpretation, token_normalization)
-            # No change: still allow a tiny denoise if >0 (acts like gentle img2img)
-            lat_out = self._sample(
-                model, pos, neg, {"samples": x0}, seed, steps, cfg, sampler_name, scheduler, denoise
-            )
+            lat_out = self._sample(model, pos, neg, {"samples": x0}, seed, steps, cfg, sampler_name, scheduler, denoise)
             img_out = self._decode(vae, lat_out)
             return img_out, lat_out
 
+        # ------------------ inner pass (masked or unmasked) ------------------
+
         def one_outpaint_pass(
-            x_in: torch.Tensor, pad: Tuple[int, int, int, int], steps_: int, denoise_: float, seed_: int
+            x_in: torch.Tensor,
+            pad: Tuple[int, int, int, int],
+            steps_: int,
+            denoise_: float,
+            seed_: int,
+            use_mask: bool,
         ):
-            # 3) pad latent and build a soft border mask
-            x_padded, (y0, x0_) = _pad_latent_with_center(x_in, pad)
-            _, _, H, W = x_padded.shape
+            # Pad latent and build soft border mask
+            x_padded, _ = _pad_latent_with_center(x_in, pad)
+            Bp, Cp, H, W = x_padded.shape
 
-            mask_border_soft = _make_soft_border_mask_lat(H, W, pad, feather_lat, device=device)
-            # noise mask: where to add noise (only in border area), scaled by noise_outside
-            if isinstance(noise_outside, (int, float)):
-                noise_scale = float(noise_outside)
-            else:
-                noise_scale = 1.0
-            noise_mask_scaled = (mask_border_soft * max(0.0, min(1.0, noise_scale))).clamp(0.0, 1.0)
-            # Expand to sampler-expected shape [B,C,H,W]
-            Bc, Cc = x_padded.shape[0], x_padded.shape[1]
-            mask_for_sampler = noise_mask_scaled
-            if mask_for_sampler.shape[0] != Bc or mask_for_sampler.shape[1] != Cc:
-                mask_for_sampler = mask_for_sampler.expand(Bc, Cc, H, W)
+            mask_border_soft = _make_soft_border_mask_lat(H, W, pad, feather_lat, device=x_padded.device)  # [1,1,H,W]
+            mask_border_soft = mask_border_soft.to(dtype=x_padded.dtype)
 
-            # 4) build conditionings
+            # Allow denoise/noise only in border
+            noise_scale = float(noise_outside) if isinstance(noise_outside, (int, float)) else 1.0
+            noise_mask_scaled = (mask_border_soft * max(0.0, min(1.0, noise_scale))).clamp(0.0, 1.0)  # [1,1,H,W]
+            denoise_mask_b1 = noise_mask_scaled.expand(Bp, 1, H, W).contiguous()
+
+            # Build conditionings
             pos = self._encode_cond(clip, prompt, weight_interpretation, token_normalization)
             neg = self._encode_cond(clip, negative, weight_interpretation, token_normalization)
 
-            # Increase denoise a bit for larger expansions to encourage content growth
-            eff_denoise = denoise_
-            if max(pad) >= _pix_to_lat(192):
-                eff_denoise = max(denoise_, 0.90)
+            # Deterministic border noise
+            g = torch.Generator(device=x_padded.device)
+            g.manual_seed(int(seed_))
+            border_noise = torch.randn_like(x_padded, generator=g)
 
-            # 5) sample with noise only in border, keep interior stable
-            ks_params = self._ksampler_params()
-            if ("denoise_mask" in ks_params) or ("noise_mask" in ks_params):
-                # Seed explicit noise in the border, then restrict denoising to that region
-                noise = torch.randn_like(x_padded)
-                m = noise_mask_scaled.to(dtype=x_padded.dtype, device=x_padded.device)
-                x_start = x_padded * (1.0 - m) + noise * m
-                lat_padded_dict = {"samples": x_start}
-                sampled = self._sample(
-                    model,
-                    pos,
-                    neg,
-                    lat_padded_dict,
-                    seed_,
-                    steps_,
-                    cfg,
-                    sampler_name,
-                    scheduler,
-                    eff_denoise,
-                    noise_mask=mask_for_sampler.to(dtype=x_padded.dtype, device=x_padded.device),
-                    disable_noise=None,
-                )
-            elif "disable_noise" in ks_params:
-                # Emulate: inject explicit noise in the border and disable sampler noise
-                noise = torch.randn_like(x_padded)
-                m = noise_mask_scaled.to(dtype=x_padded.dtype, device=x_padded.device)
-                x_start = x_padded * (1.0 - m) + noise * m
-                lat_padded_dict = {"samples": x_start}
-                sampled = self._sample(
-                    model,
-                    pos,
-                    neg,
-                    lat_padded_dict,
-                    seed_,
-                    steps_,
-                    cfg,
-                    sampler_name,
-                    scheduler,
-                    eff_denoise,
-                    noise_mask=None,
-                    disable_noise=True,
-                )
+            # Seed: if masked pass → seed only border; if unmasked → seed full latent
+            if use_mask:
+                x_start = x_padded * (1.0 - denoise_mask_b1) + border_noise * denoise_mask_b1
             else:
-                # Fallback: at least seed noise in the border, keep sampler noise enabled
-                noise = torch.randn_like(x_padded)
-                m = noise_mask_scaled.to(dtype=x_padded.dtype, device=x_padded.device)
-                x_start = x_padded * (1.0 - m) + noise * m
-                lat_padded_dict = {"samples": x_start}
-                sampled = self._sample(
-                    model,
-                    pos,
-                    neg,
-                    lat_padded_dict,
-                    seed_,
-                    steps_,
-                    cfg,
-                    sampler_name,
-                    scheduler,
-                    eff_denoise,
-                    noise_mask=None,
-                    disable_noise=None,
-                )
+                x_start = border_noise  # full latent noise for free growth
 
-            # 6) optional fallback: if border is still near-flat (solid color), try a stronger unmasked grow
-            with torch.no_grad():
-                m1 = noise_mask_scaled.to(dtype=s.dtype, device=s.device)
-                # compute variance only over border region
-                border_vals = s * m1
-                flat_score = border_vals.var().item() if border_vals.numel() > 0 else 0.0
-            if flat_score < 1e-6:
-                # Re-run from the same noise-seeded latent but without mask and with higher denoise
-                stronger = self._sample(
-                    model,
-                    pos,
-                    neg,
-                    {"samples": x_start},
-                    seed_,
-                    steps_,
-                    cfg,
-                    sampler_name,
-                    scheduler,
-                    denoise=min(1.0, eff_denoise + 0.1),
-                    noise_mask=None,
-                    disable_noise=None,
-                )
-                s = stronger["samples"].to(device=x_padded.device, dtype=x_padded.dtype)
+            ks_params = self._ksampler_params()
+            pass_mask_as_kw = ("denoise_mask" in ks_params) or ("noise_mask" in ks_params)
+            lat_padded_dict = {"samples": x_start}
 
-            # 7) re-blend to guarantee interior stability (align dtype/device)
-            s = sampled["samples"]
-            if s.device != x_padded.device or s.dtype != x_padded.dtype:
-                s = s.to(device=x_padded.device, dtype=x_padded.dtype)
-            x_new = _blend_keep_interior(s, x_padded, mask_border_soft)
-
-            return {"samples": x_new}
-
-        # two-stage: grow half then full for large pads (reduces stretching / context shock)
-        if two_stage_growth and any(p > _pix_to_lat(384) for p in pad_lat):
-            half_pad = tuple(max(1, p // 2) for p in pad_lat)
-            # pass 1: shorter steps, milder denoise
-            lat_mid = one_outpaint_pass(
-                x0, half_pad, max(12, int(steps * 0.6)), max(0.35, denoise * 0.85), seed
-            )  # keep seed stable
-            # pass 2: the remaining pad (delta)
-            rem_pad = tuple(p - hp for p, hp in zip(pad_lat, half_pad))
-            lat_full = one_outpaint_pass(
-                lat_mid["samples"], rem_pad, steps, denoise, seed
+            sampled = self._sample(
+                model,
+                pos,
+                neg,
+                lat_padded_dict,
+                seed_,
+                steps_,
+                cfg,
+                sampler_name,
+                scheduler,
+                denoise_,
+                noise_mask=(denoise_mask_b1 if (use_mask and pass_mask_as_kw) else None),
+                disable_noise=None,
             )
-            lat_out = lat_full
-        else:
-            # single pass
-            lat_out = one_outpaint_pass(x0, pad_lat, steps, denoise, seed)
+
+            s = sampled["samples"]
+            # Re-blend to guarantee interior identity if this was a masked pass
+            if use_mask:
+                if s.device != x_padded.device or s.dtype != x_padded.dtype:
+                    s = s.to(device=x_padded.device, dtype=x_padded.dtype)
+                s = _blend_keep_interior(s, x_padded, mask_border_soft)
+            return {"samples": s}, denoise_mask_b1, mask_border_soft
+
+        # ---------------- two-stage & two-phase orchestration ----------------
+
+        # two-stage: grow half then full (reduces stretching/context shock)
+        def staged_pad_sequence(pad):
+            if two_stage_growth and any(p > _pix_to_lat(384) for p in pad):
+                half = tuple(max(1, p // 2) for p in pad)
+                rem = tuple(p - h for p, h in zip(pad, half))
+                return [half, rem]
+            return [pad]
+
+        lat_current = {"samples": x0}
+        last_mask_b1 = None
+        last_soft_mask = None
+
+        for idx, pad_chunk in enumerate(staged_pad_sequence(pad_lat), start=1):
+            if two_phase_schedule:
+                # Phase 1: unmasked grow
+                grow_steps = max(8, int(steps * float(grow_steps_frac)))
+                grow_dnz = float(max(denoise, grow_denoise))
+                lat_grow, _, _ = one_outpaint_pass(
+                    lat_current["samples"], pad_chunk, grow_steps, grow_dnz, seed, use_mask=False
+                )
+                # Phase 2: masked refine
+                refine_steps = max(6, steps - grow_steps)
+                ref_dnz = float(min(denoise, refine_denoise))
+                lat_refine, mask_b1, soft_mask = one_outpaint_pass(
+                    lat_grow["samples"], (0, 0, 0, 0), refine_steps, ref_dnz, seed, use_mask=True
+                )
+                lat_current = lat_refine
+                last_mask_b1, last_soft_mask = mask_b1, soft_mask
+            else:
+                # Single masked pass for this stage
+                eff_dnz = denoise
+                if max(pad_chunk) >= _pix_to_lat(192):
+                    eff_dnz = max(denoise, 0.90)
+                lat_current, mask_b1, soft_mask = one_outpaint_pass(
+                    lat_current["samples"], pad_chunk, steps, eff_dnz, seed, use_mask=True
+                )
+                last_mask_b1, last_soft_mask = mask_b1, soft_mask
+
+        lat_out = lat_current
 
         # Optional refiner pass (lower denoise, separate model)
         if use_refiner and refiner_model is not None and refiner_steps > 0 and refiner_denoise > 0.0:
@@ -483,13 +516,20 @@ class IllustriousAutoOutpaint:
                 lat_out,
                 seed,
                 refiner_steps,
-                cfg=max(4.8, min(cfg, 7.0)),  # modest CFG on refiner
+                cfg=max(4.8, min(cfg, 7.0)),
                 sampler_name=sampler_name,
                 scheduler=scheduler,
                 denoise=refiner_denoise,
-                noise_mask=None,  # full latent refine
+                noise_mask=None,
             )
 
-        # 7) decode
+        # Decode
         img_out = self._decode(vae, lat_out)
+
+        # Seam-toning micro-pass (NHWC)
+        if seam_toning and last_mask_b1 is not None:
+            img_out = _seam_tone(
+                img_out, last_mask_b1, strength=float(seam_tone_strength), feather_px_img=int(seam_feather_px)
+            )
+
         return img_out, lat_out
