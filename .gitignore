@@ -28,6 +28,5 @@ backup
 node.zip
 
 .claude
-.github
 .vscode
 data/smart_prompt_stats.yaml
