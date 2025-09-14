@@ -303,7 +303,19 @@ class IllustriousSmartSceneGenerator:
             else:
                 prompt = str(result)
 
-            # Apply optional TIPO optimization
+            # User requested style: prepend high-quality weighted block like
+            # (masterpiece, best quality, ultra-detailed, highres:1.2)
+            # We'll allow override via optional inputs later; for now inject if not already present.
+
+            quality_block = "(masterpiece, best quality, ultra-detailed, highres:1.2)"
+            # Detect if user already supplied a quality block (rough heuristic)
+            q_present = False
+            base_lower = (prompt or "").lower()
+            for token in ["masterpiece", "best quality", "ultra-detailed", "highres"]:
+                if token in base_lower:
+                    q_present = True
+                    break
+
             tipo_enabled = kwargs.get("Enable TIPO Optimization", True)
             tipo_meta = {}
             strict_tags_flag = kwargs.get("Strict Tags (no phrases)", True)
@@ -329,6 +341,15 @@ class IllustriousSmartSceneGenerator:
                     token_normalization=kwargs.get("Token Normalization", "none"),
                 )
 
+            # Re-check presence after optimization (it may have reordered tokens)
+            if not q_present:
+                pl = (prompt or "").lower()
+                if any(t in pl for t in ["masterpiece", "best quality", "ultra-detailed", "highres"]):
+                    q_present = True
+            if strict_tags_flag and not q_present:
+                # Prepend quality block, ensuring proper comma separation
+                prompt = f"{quality_block}, {prompt}" if prompt else quality_block
+
             # Optionally augment with an explicit Emotion/Expression (if provided)
             emotion = kwargs.get("Emotion/Expression", "-")
             if (not emotion or emotion == "-"):
@@ -352,10 +373,15 @@ class IllustriousSmartSceneGenerator:
                     phrase = f"with a {emotion} expression"
                     prompt = f"{prompt}. {phrase}." if prompt and not prompt.strip().endswith(".") else f"{prompt} {phrase}." if prompt else f"{phrase}."
 
-            # Optionally convert to Danbooru-style tags
-            # Only convert to tag style if strict tagging is enabled
+            # If Danbooru tag style is ON we should not destroy the weighted parentheses block.
+            # We'll temporarily remove the quality block, format remaining tags, then restore it.
             if kwargs.get("Danbooru Tag Style", True) and strict_tags_flag:
-                prompt = self._format_danbooru_tags(prompt)
+                if prompt.startswith(quality_block):
+                    rest = prompt[len(quality_block):].lstrip(", ")
+                    rest_fmt = self._format_danbooru_tags(rest)
+                    prompt = f"{quality_block}, {rest_fmt}" if rest_fmt else quality_block
+                else:
+                    prompt = self._format_danbooru_tags(prompt)
 
             # Generate comprehensive metadata
             generation_time = time.time() - start_time
@@ -363,7 +389,7 @@ class IllustriousSmartSceneGenerator:
 
             metadata = {
                 "generator": "Illustrious Smart Scene Generator",
-                "version": "2.2 - Token Budget + Sentence Mode",
+                "version": "2.3 - Quality Block + Token Budget",
                 "system": "Anime Scene Vocabulary System + Anime Composition System",
                 "category": category,
                 "complexity": kwargs.get("Complexity", "medium"),
