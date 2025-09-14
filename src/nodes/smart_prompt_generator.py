@@ -248,6 +248,23 @@ class IllustriousSmartSceneGenerator:
                         "tooltip": "Randomization seed (0 = auto)",
                     },
                 ),
+                # Baseline / upscaling / negative helpers
+                "Subject Fallback": (
+                    ["none", "1girl", "1boy", "solo", "1girl, solo"],
+                    {"default": "none", "tooltip": "Inject baseline subject tokens when person description is off."},
+                ),
+                "Upscale Tags": (
+                    ["none", "anime_hd", "ultra_hd", "photo_8k"],
+                    {"default": "none", "tooltip": "Prepend additional high-resolution/upscale tags after quality block."},
+                ),
+                "Negative Preset": (
+                    ["none", "standard", "aggressive", "anime_clean", "photoreal"],
+                    {"default": "none", "tooltip": "Generate a negative prompt using a curated preset."},
+                ),
+                "Generate Negative Output": (
+                    "BOOLEAN",
+                    {"default": False, "tooltip": "If true, second output returns the negative prompt string."},
+                ),
             },
             "optional": {
                 # Prompt weighting preferences (used for how we express optional emphasis)
@@ -286,8 +303,8 @@ class IllustriousSmartSceneGenerator:
             },
         }
 
-    RETURN_TYPES = ("STRING", "STRING")
-    RETURN_NAMES = ("prompt", "metadata")
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("prompt", "negative", "metadata")
     FUNCTION = "generate_smart_prompt"
     CATEGORY = "Illustrious/🎭 Smart Scene Generation"
 
@@ -350,6 +367,39 @@ class IllustriousSmartSceneGenerator:
                 # Prepend quality block, ensuring proper comma separation
                 prompt = f"{quality_block}, {prompt}" if prompt else quality_block
 
+            # Inject Upscale Tags (after quality block) if selected
+            upscale_map = {
+                "none": [],
+                "anime_hd": ["highres", "detailed background"],
+                "ultra_hd": ["8k", "ultra-detailed", "extremely detailed"],
+                "photo_8k": ["RAW photo", "8k", "highres", "ultra-detailed"],
+            }
+            upscale_choice = kwargs.get("Upscale Tags", "none")
+            if strict_tags_flag and upscale_choice in upscale_map and upscale_choice != "none":
+                up_tokens = [t for t in upscale_map[upscale_choice] if t.lower() not in (prompt.lower() if prompt else "")]
+                if up_tokens:
+                    if prompt.startswith(quality_block):
+                        # Split off existing prefix
+                        rest = prompt[len(quality_block):].lstrip(", ")
+                        prompt = f"{quality_block}, {', '.join(up_tokens)}" + (f", {rest}" if rest else "")
+                    else:
+                        prompt = ", ".join(up_tokens + ([prompt] if prompt else []))
+
+            # Subject fallback injection (only if person description absent and tokens missing)
+            subj_fb = kwargs.get("Subject Fallback", "none")
+            if strict_tags_flag and subj_fb and subj_fb != "none":
+                fb_tokens = [t.strip() for t in subj_fb.split(",") if t.strip()]
+                lower_prompt = (prompt or "").lower()
+                inject = [t for t in fb_tokens if t.lower() not in lower_prompt]
+                if inject:
+                    # Add after quality block & upscale tags
+                    if prompt.startswith(quality_block):
+                        # find after quality block
+                        after = prompt[len(quality_block):].lstrip(", ")
+                        prompt = f"{quality_block}, {', '.join(inject)}" + (f", {after}" if after else "")
+                    else:
+                        prompt = ", ".join(inject + ([prompt] if prompt else []))
+
             # Optionally augment with an explicit Emotion/Expression (if provided)
             emotion = kwargs.get("Emotion/Expression", "-")
             if (not emotion or emotion == "-"):
@@ -383,13 +433,55 @@ class IllustriousSmartSceneGenerator:
                 else:
                     prompt = self._format_danbooru_tags(prompt)
 
+            # Negative prompt helper generation
+            neg_preset = kwargs.get("Negative Preset", "none")
+            negative_prompt = ""
+            if neg_preset and neg_preset != "none":
+                neg_map = {
+                    "standard": [
+                        "(worst quality:1.2)", "(low quality:1.2)", "(normal quality:1.2)",
+                        "lowres", "bad anatomy", "bad hands", "text", "error", "extra digits",
+                        "fewer digits", "cropped", "blurry", "jpeg artifacts", "signature", "watermark",
+                        "username", "artist name",
+                    ],
+                    "aggressive": [
+                        "(worst quality:1.3)", "(low quality:1.3)", "(normal quality:1.3)",
+                        "lowres", "bad anatomy", "bad hands", "text", "error", "extra digits", "fewer digits",
+                        "cropped", "blurry", "jpeg artifacts", "signature", "watermark", "username",
+                        "artist name", "deformed", "mutated", "long neck", "long body", "bad proportions",
+                        "poorly drawn face", "poorly drawn hands",
+                    ],
+                    "anime_clean": [
+                        "(worst quality:1.2)", "(low quality:1.2)", "(normal quality:1.2)",
+                        "lowres", "bad anatomy", "bad hands", "text", "error", "extra digits",
+                        "fewer digits", "blurry", "jpeg artifacts", "signature", "watermark", "nsfw",
+                    ],
+                    "photoreal": [
+                        "(worst quality:1.2)", "(low quality:1.2)", "(normal quality:1.2)",
+                        "lowres", "bad anatomy", "bad hands", "text", "error", "extra digits", "fewer digits",
+                        "cropped", "blurry", "jpeg artifacts", "signature", "watermark", "unnatural skin",
+                        "overprocessed", "grain", "deformed", "mutated",
+                    ],
+                }
+                toks = neg_map.get(neg_preset, [])
+                # Dedupe + join
+                seen = set()
+                deduped = []
+                for t in toks:
+                    k = t.lower()
+                    if k not in seen:
+                        seen.add(k)
+                        deduped.append(t)
+                negative_prompt = ", ".join(deduped)
+            gen_neg_out = bool(kwargs.get("Generate Negative Output", False))
+
             # Generate comprehensive metadata
             generation_time = time.time() - start_time
             category = kwargs.get("Category", "Outdoor")
 
             metadata = {
                 "generator": "Illustrious Smart Scene Generator",
-                "version": "2.3 - Quality Block + Token Budget",
+                "version": "2.4 - Quality/Subject/Upscale + Neg Helper",
                 "system": "Anime Scene Vocabulary System + Anime Composition System",
                 "category": category,
                 "complexity": kwargs.get("Complexity", "medium"),
@@ -449,6 +541,10 @@ class IllustriousSmartSceneGenerator:
                 },
                 # TIPO metadata
                 "tipo": tipo_meta,
+                "negative": {
+                    "preset": neg_preset,
+                    "prompt": negative_prompt,
+                },
             }
 
             # Update statistics
@@ -456,7 +552,12 @@ class IllustriousSmartSceneGenerator:
                 category, kwargs.get("Complexity", "medium"), generation_time, kwargs
             )
 
-            return prompt, json.dumps(metadata, indent=2)
+            # Outputs: prompt, (negative or metadata), metadata (third)
+            if gen_neg_out:
+                return prompt, (negative_prompt or ""), json.dumps(metadata, indent=2)
+            else:
+                # Maintain backward-ish compatibility: second output empty when not used
+                return prompt, (negative_prompt or ""), json.dumps(metadata, indent=2)
         except Exception as e:
             # Return detailed error information
             error_metadata = {
@@ -475,6 +576,7 @@ class IllustriousSmartSceneGenerator:
 
             return (
                 f"Error generating anime scene prompt: {str(e)}",
+                "",
                 json.dumps(error_metadata, indent=2),
             )
 
