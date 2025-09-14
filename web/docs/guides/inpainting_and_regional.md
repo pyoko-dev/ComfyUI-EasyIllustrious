@@ -8,7 +8,7 @@ This short guide explains what each feature does, when to use it, and how to set
 - When to use: Fix/replace part of an image (hands, face, background section) while keeping the rest untouched.
 - How to use:
   1. Drop "VAE Encode (Illustrious)" and set mode = inpaint.
-  2. Connect your mask (white = change). Feather the mask for soft edges.
+  2. Connect your mask (black = protect, white = change). Use generous feathering for soft, seam-free edges.
   3. Optional: connect a reference image to guide the masked area.
   4. Sample as usual. Only the masked area will be denoised.
 
@@ -31,7 +31,7 @@ No. Keep VAE in standard mode unless you are explicitly doing inpainting. Region
 
 ## Tips
 
-- Masks: White = apply here. Use feathered edges (blur) for smoother blends.
+- Masks: Black = protect/keep, White = change/apply. Use stronger feathering (blur 8–16px at image size) for smoother blends.
 - CFG Scale: ~5.0 is a good starting point for Illustrious models.
 - Steps: Increase for complex multi-region scenes.
 - Overlaps: If region masks overlap, weights will be normalized to avoid over-driving any pixel.

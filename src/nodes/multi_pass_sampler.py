@@ -36,6 +36,19 @@ def _lerp(a, b, w):
     return a * (1.0 - w) + b * w
 
 
+def _soften_mask(m: torch.Tensor, k: int = 11) -> torch.Tensor:
+    try:
+        if m is None or not isinstance(m, torch.Tensor):
+            return m
+        k = max(1, int(k) | 1)
+        pad = k // 2
+        w = torch.ones((1, 1, k, k), device=m.device, dtype=m.dtype) / float(k * k)
+        mb = torch.nn.functional.conv2d(m, w, padding=pad)
+        return torch.clamp(mb, 0.0, 1.0)
+    except Exception:
+        return m
+
+
 # ---------- Version-aware presets (EPS vs VPred) ----------
 
 def _preferred_samplers_for_mode(mode: str):
@@ -151,29 +164,39 @@ class IllustriousMultiPassSampler:
         return self._ks_params
 
     def _run_common(self, model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_in, denoise=1.0, sigmas=None):
-        # Preserve noise_mask if present and pass using supported arg name
-        # Avoid duplication of mask in latent dict; pass via kwargs only
-        if isinstance(latent_in, dict):
-            latent_in = dict(latent_in)
-            latent_in.pop("noise_mask", None)
-            latent_in.pop("denoise_mask", None)
-        args = (model, int(seed), int(steps), float(cfg), sampler_name, scheduler, positive, negative, latent_in)
+        # Extract mask if present, then remove from latent dict to avoid duplication
+        nm = None
+        orig = None
+        li = latent_in
+        if isinstance(li, dict):
+            nm = li.get("noise_mask") or li.get("denoise_mask")
+            orig = li.get("samples") if isinstance(li.get("samples"), torch.Tensor) else None
+            li = dict(li)
+            li.pop("noise_mask", None)
+            li.pop("denoise_mask", None)
+
+        # Use the cleaned latent dict (without mask keys)
+        args = (model, int(seed), int(steps), float(cfg), sampler_name, scheduler, positive, negative, li)
         kwargs = {"denoise": float(denoise)}
+
         # Pass-through custom sigmas if the core supports it
         try:
             ks_params = self._ksampler_params()
         except Exception:
             ks_params = set()
-        # Wire noise mask if available
-        try:
-            nm = latent_in.get("noise_mask") if isinstance(latent_in, dict) else None
-        except Exception:
-            nm = None
+
+        # Wire mask if available (prefer core 'mask' param when supported). Core expects 1.0=protect.
         if nm is not None:
-            if "denoise_mask" in ks_params:
+            if "mask" in ks_params:
+                try:
+                    kwargs["mask"] = 1.0 - torch.clamp(nm, 0.0, 1.0)
+                except Exception:
+                    kwargs["mask"] = nm
+            elif "denoise_mask" in ks_params:
                 kwargs["denoise_mask"] = nm
             elif "noise_mask" in ks_params:
                 kwargs["noise_mask"] = nm
+
         if sigmas is not None and "sigmas" in ks_params:
             try:
                 if hasattr(sigmas, "detach"):
@@ -181,22 +204,49 @@ class IllustriousMultiPassSampler:
             except Exception:
                 pass
             kwargs["sigmas"] = sigmas
+
         out = common_ksampler(*args, **kwargs)
+
         # normalize to {"samples": tensor}
         if isinstance(out, dict) and "samples" in out and isinstance(out["samples"], torch.Tensor):
-            return {"samples": out["samples"]}
-        if isinstance(out, torch.Tensor):
-            return {"samples": out}
-        if isinstance(out, (list, tuple)):
+            result = {"samples": out["samples"]}
+        elif isinstance(out, torch.Tensor):
+            result = {"samples": out}
+        elif isinstance(out, (list, tuple)):
             for it in out:
                 if isinstance(it, torch.Tensor):
-                    return {"samples": it}
+                    result = {"samples": it}
+                    break
                 if isinstance(it, dict) and "samples" in it and isinstance(it["samples"], torch.Tensor):
-                    return {"samples": it["samples"]}
-        maybe = getattr(out, "samples", None)
-        if isinstance(maybe, torch.Tensor):
-            return {"samples": maybe}
-        raise TypeError(f"Unsupported sampler return type: {type(out)}")
+                    result = {"samples": it["samples"]}
+                    break
+            else:
+                maybe = getattr(out, "samples", None)
+                if isinstance(maybe, torch.Tensor):
+                    result = {"samples": maybe}
+                else:
+                    raise TypeError(f"Unsupported sampler return type: {type(out)}")
+        else:
+            maybe = getattr(out, "samples", None)
+            if isinstance(maybe, torch.Tensor):
+                result = {"samples": maybe}
+            else:
+                raise TypeError(f"Unsupported sampler return type: {type(out)}")
+
+    # Protect keep/black area by re-blending original latent where mask==0 (no extra softening by default)
+        try:
+            if nm is not None and isinstance(result.get("samples"), torch.Tensor) and isinstance(orig, torch.Tensor):
+                s = result["samples"]
+                m = nm.to(device=s.device, dtype=s.dtype)
+                if m.shape[1] != 1:
+                    m = m[:, :1, :, :]
+                keep = 1.0 - m  # black protects
+                x0 = orig.to(device=s.device, dtype=s.dtype)
+                result["samples"] = s * m + x0 * keep
+        except Exception:
+            pass
+
+        return result
 
     def multi_pass_sample(
         self,
@@ -218,10 +268,10 @@ class IllustriousMultiPassSampler:
         adaptive_transition=True,
         preserve_composition=True,
         reuse_noise=False,
-        detail_seed_offset=1,
-        model_version="auto",
+    detail_seed_offset=1,
+    model_version="auto",
     sigmas=None,
-        **kw,
+    **kw,
     ):
 
         device = comfy.model_management.get_torch_device()
@@ -497,43 +547,75 @@ class IllustriousTriplePassSampler:
 
     # ---- common_ksampler bridge (duplicate to avoid dependency on MultiPass) ----
     def _run_common(self, model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_in, denoise=1.0):
-        # Avoid duplication of mask in latent dict; pass via kwargs only
-        if isinstance(latent_in, dict):
-            latent_in = dict(latent_in)
-            latent_in.pop("noise_mask", None)
-            latent_in.pop("denoise_mask", None)
-        args = (model, int(seed), int(steps), float(cfg), sampler_name, scheduler, positive, negative, latent_in)
+        # Extract mask if present, then remove from latent dict to avoid duplication
+        nm = None
+        orig = None
+        li = latent_in
+        if isinstance(li, dict):
+            nm = li.get("noise_mask") or li.get("denoise_mask")
+            orig = li.get("samples") if isinstance(li.get("samples"), torch.Tensor) else None
+            li = dict(li)
+            li.pop("noise_mask", None)
+            li.pop("denoise_mask", None)
+        args = (model, int(seed), int(steps), float(cfg), sampler_name, scheduler, positive, negative, li)
         kwargs = {"denoise": float(denoise)}
-        # Wire noise mask if available on this ComfyUI build
+        # Prefer core 'mask' param when supported
         try:
             ks_params = set(inspect.signature(common_ksampler).parameters.keys())
         except Exception:
             ks_params = set()
-        try:
-            nm = latent_in.get("noise_mask") if isinstance(latent_in, dict) else None
-        except Exception:
-            nm = None
         if nm is not None:
-            if "denoise_mask" in ks_params:
+            if "mask" in ks_params:
+                try:
+                    kwargs["mask"] = 1.0 - torch.clamp(nm, 0.0, 1.0)
+                except Exception:
+                    kwargs["mask"] = nm
+            elif "denoise_mask" in ks_params:
                 kwargs["denoise_mask"] = nm
             elif "noise_mask" in ks_params:
                 kwargs["noise_mask"] = nm
+
         out = common_ksampler(*args, **kwargs)
         # normalize to {"samples": tensor}
         if isinstance(out, dict) and "samples" in out and isinstance(out["samples"], torch.Tensor):
-            return {"samples": out["samples"]}
-        if isinstance(out, torch.Tensor):
-            return {"samples": out}
-        if isinstance(out, (list, tuple)):
+            result = {"samples": out["samples"]}
+        elif isinstance(out, torch.Tensor):
+            result = {"samples": out}
+        elif isinstance(out, (list, tuple)):
             for it in out:
                 if isinstance(it, torch.Tensor):
-                    return {"samples": it}
+                    result = {"samples": it}
+                    break
                 if isinstance(it, dict) and "samples" in it and isinstance(it["samples"], torch.Tensor):
-                    return {"samples": it["samples"]}
-        maybe = getattr(out, "samples", None)
-        if isinstance(maybe, torch.Tensor):
-            return {"samples": maybe}
-        raise TypeError(f"Unsupported sampler return type: {type(out)}")
+                    result = {"samples": it["samples"]}
+                    break
+            else:
+                maybe = getattr(out, "samples", None)
+                if isinstance(maybe, torch.Tensor):
+                    result = {"samples": maybe}
+                else:
+                    raise TypeError(f"Unsupported sampler return type: {type(out)}")
+        else:
+            maybe = getattr(out, "samples", None)
+            if isinstance(maybe, torch.Tensor):
+                result = {"samples": maybe}
+            else:
+                raise TypeError(f"Unsupported sampler return type: {type(out)}")
+
+    # Protect keep/black area by re-blending original latent where mask==0 (no extra softening by default)
+        try:
+            if nm is not None and isinstance(result.get("samples"), torch.Tensor) and isinstance(orig, torch.Tensor):
+                s = result["samples"]
+                m = nm.to(device=s.device, dtype=s.dtype)
+                if m.shape[1] != 1:
+                    m = m[:, :1, :, :]
+                keep = 1.0 - m  # black protects
+                x0 = orig.to(device=s.device, dtype=s.dtype)
+                result["samples"] = s * m + x0 * keep
+        except Exception:
+            pass
+
+        return result
 
     def triple_pass_sample(
         self,
@@ -569,10 +651,9 @@ class IllustriousTriplePassSampler:
         detail_seed_offset=2,
         nan_guard=True,
         stability_clamp=20.0,
-    model_version="auto",
-    **kw,
+        model_version="auto",
+        **kw,
     ):
-
         device = comfy.model_management.get_torch_device()
         base_latent = latent_image["samples"].to(device)
 

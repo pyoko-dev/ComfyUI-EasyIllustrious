@@ -53,6 +53,10 @@ class IllustriousKSamplerPro:
                 "Advanced Logs": ("BOOLEAN", {"default": False}),
                 # Accept direct SIGMAS from scheduler nodes.
                 "sigmas": ("SIGMAS", {"tooltip": "Direct schedule tensor (SIGMAS) to override scheduler logic."}),
+                # Seam control (off by default for crisp results)
+                "Edge Feather (px)": ("INT", {"default": 0, "min": 0, "max": 32, "step": 1, "tooltip": "Feather mask edges in latent px before reblend; 0 = off."}),
+                "Edge Tone Match": ("BOOLEAN", {"default": False, "tooltip": "Match tone near mask edge before reblend (reduces seams, can soften)."}),
+                "Tone Strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Blend weight of tone match when enabled."}),
             },
         }
         return base
@@ -121,7 +125,17 @@ class IllustriousKSamplerPro:
         args=(model,int(seed),int(steps),float(cfg),sampler_name,scheduler,positive,negative,latent_dict)
         ks_params=self._ksampler_params(); kwargs={"denoise":float(denoise)}
         if noise_mask is not None:
-            if "denoise_mask" in ks_params:
+            # Prefer core inpaint 'mask' if available for per-step protection
+            # Comfy's core 'mask' expects 1.0 = protect/keep. Our semantics: white = change.
+            # Invert for the core call to match Comfy expectations.
+            if "mask" in ks_params:
+                core_mask = noise_mask
+                try:
+                    core_mask = 1.0 - torch.clamp(core_mask, 0.0, 1.0)
+                except Exception:
+                    pass
+                kwargs["mask"] = core_mask
+            elif "denoise_mask" in ks_params:
                 kwargs["denoise_mask"] = noise_mask
             elif "noise_mask" in ks_params:
                 kwargs["noise_mask"] = noise_mask
@@ -147,25 +161,72 @@ class IllustriousKSamplerPro:
         raise TypeError(f"Unsupported sampler return type: {type(out)}")
 
     # ---- main ----
-    def sample(self,model,seed,positive,negative,latent_image,
-               steps=26,cfg=5.2,sampler_name="euler_ancestral",scheduler="karras",
-               denoise=1.0,sigmas=None,**kw):
+    def _soften_mask(self, m: torch.Tensor, k: int = 9) -> torch.Tensor:
+        """Box-blur the single-channel latent mask [B,1,H,W] to soften edges."""
+        try:
+            if m is None or not isinstance(m, torch.Tensor):
+                return m
+            k = max(1, int(k) | 1)
+            pad = k // 2
+            weight = torch.ones((1, 1, k, k), device=m.device, dtype=m.dtype) / float(k * k)
+            mb = torch.nn.functional.conv2d(m, weight, padding=pad)
+            return torch.clamp(mb, 0.0, 1.0)
+        except Exception:
+            return m
 
-        mv=kw.get("Model Version","Auto Detect")
-        res_adapt=kw.get("Resolution Adaptive",True)
-        auto_cfg=kw.get("Auto CFG",True)
-        color_safe=kw.get("Color Safe Mode",True)
-        seed_offset=kw.get("Seed Offset",0)
-        adv_logs=kw.get("Advanced Logs",False)
+    def _smoothstep(self, edge0: float, edge1: float, x: torch.Tensor) -> torch.Tensor:
+        t = torch.clamp((x - edge0) / max(1e-6, (edge1 - edge0)), 0.0, 1.0)
+        return t * t * (3.0 - 2.0 * t)
 
-        device=model_management.get_torch_device()
+    def _weighted_stats(self, x: torch.Tensor, w: torch.Tensor):
+        # x: [B,C,H,W], w: [B,1,H,W]
+        ws = torch.clamp(w, 0.0, 1.0)
+        ws_sum = ws.sum(dim=(2, 3), keepdim=True).clamp(min=1e-6)
+        mean = (x * ws).sum(dim=(2, 3), keepdim=True) / ws_sum
+        var = ((x - mean) ** 2 * ws).sum(dim=(2, 3), keepdim=True) / ws_sum
+        std = torch.sqrt(var + 1e-6)
+        return mean, std
+
+    def _match_edge_tone(self, s: torch.Tensor, x0: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
+        # Build an edge band weight around the mask transition
+        # band ~ in (0.1..0.9) with a soft profile
+        inner = self._smoothstep(0.05, 0.35, m)
+        outer = 1.0 - self._smoothstep(0.65, 0.95, m)
+        band = (inner * outer).clamp(0.0, 1.0)  # [B,1,H,W]
+        if band.max() <= 0:
+            return s
+        # Compute weighted stats in band for both s and x0
+        mean_s, std_s = self._weighted_stats(s, band)
+        mean_x0, std_x0 = self._weighted_stats(x0, band)
+        # Tone match inside masked region only; clamp ratio
+        ratio = (std_x0 / std_s).clamp(0.5, 2.0)
+        s_adj = (s - mean_s) * ratio + mean_x0
+        # Blend adjustment stronger near edge, lighter deep inside
+        edge_strength = band  # already peaked at edge
+        s = s * (1.0 - edge_strength) + s_adj * edge_strength
+        return s
+
+    def sample(self, model, seed, positive, negative, latent_image,
+               steps=26, cfg=5.2, sampler_name="euler_ancestral", scheduler="karras",
+               denoise=1.0, sigmas=None, **kw):
+
+        mv = kw.get("Model Version", "Auto Detect")
+        res_adapt = kw.get("Resolution Adaptive", True)
+        auto_cfg = kw.get("Auto CFG", True)
+        color_safe = kw.get("Color Safe Mode", True)
+        seed_offset = kw.get("Seed Offset", 0)
+        adv_logs = kw.get("Advanced Logs", False)
+        edge_feather_px = kw.get("Edge Feather (px)", 0)
+        do_tone_match = kw.get("Edge Tone Match", False)
+        tone_strength = float(kw.get("Tone Strength", 0.5))
+
+        device = model_management.get_torch_device()
         # Preserve full latent dict (samples, noise_mask, etc.) and move tensors to device
         latent_in = dict(latent_image) if isinstance(latent_image, dict) else {"samples": latent_image}
         latent = latent_in.get("samples")
-        if isinstance(latent, torch.Tensor):
-            latent = latent.to(device=device)
-        else:
+        if not isinstance(latent, torch.Tensor):
             raise TypeError("latent_image['samples'] must be a torch.Tensor")
+        latent = latent.to(device=device)
         # Ensure noise_mask (if present) is on device and clamped
         nm = latent_in.get("noise_mask", None)
         if isinstance(nm, torch.Tensor):
@@ -177,29 +238,43 @@ class IllustriousKSamplerPro:
             latent_in["noise_mask"] = nm
         # Update samples tensor in the latent dict after moving to device
         latent_in["samples"] = latent
-        h,w = latent.shape[2]*8, latent.shape[3]*8
+        h, w = latent.shape[2] * 8, latent.shape[3] * 8
 
-        sampler_name=self._normalize_sampler(sampler_name)
-        if scheduler=="normal": scheduler="karras"
-        if mv=="Auto Detect": mv=self._detect_version(h,w)
+        sampler_name = self._normalize_sampler(sampler_name)
+        if scheduler == "normal":
+            scheduler = "karras"
+        if mv == "Auto Detect":
+            mv = self._detect_version(h, w)
 
         if not color_safe:
-            if res_adapt: steps=self._auto_steps(steps,h,w)
-            if auto_cfg: cfg=self._auto_cfg(cfg,h,w,mv)
-            try: sampler_name=next((s for s in self._preferred_samplers_for_version(mv)
-                                    if s in comfy.samplers.KSampler.SAMPLERS),sampler_name)
-            except: pass
-            try: scheduler=next((s for s in self._preferred_schedulers_for_version(mv)
-                                 if s in comfy.samplers.KSampler.SCHEDULERS),scheduler)
-            except: pass
+            if res_adapt:
+                steps = self._auto_steps(steps, h, w)
+            if auto_cfg:
+                cfg = self._auto_cfg(cfg, h, w, mv)
+            try:
+                sampler_name = next(
+                    (s for s in self._preferred_samplers_for_version(mv) if s in comfy.samplers.KSampler.SAMPLERS),
+                    sampler_name,
+                )
+            except Exception:
+                pass
+            try:
+                scheduler = next(
+                    (s for s in self._preferred_schedulers_for_version(mv) if s in comfy.samplers.KSampler.SCHEDULERS),
+                    scheduler,
+                )
+            except Exception:
+                pass
 
-        final_seed=(int(seed)+int(seed_offset))&0xFFFFFFFFFFFFFFFF
+        final_seed = (int(seed) + int(seed_offset)) & 0xFFFFFFFFFFFFFFFF
         if adv_logs:
-            print(f"[IllustriousKSamplerPro] v={mv} res={w}x{h} steps={steps} cfg={cfg:.2f} "
-                  f"sampler={sampler_name}/{scheduler} denoise={denoise} seed={final_seed}")
+            print(
+                f"[IllustriousKSamplerPro] v={mv} res={w}x{h} steps={steps} cfg={cfg:.2f} "
+                f"sampler={sampler_name}/{scheduler} denoise={denoise} seed={final_seed}"
+            )
 
         # If we will pass mask via kwargs, drop any mask keys from latent dict to avoid duplication
-        if nm is not None:
+        if isinstance(nm, torch.Tensor):
             try:
                 latent_in.pop("noise_mask", None)
                 latent_in.pop("denoise_mask", None)
@@ -208,17 +283,68 @@ class IllustriousKSamplerPro:
         # Choose schedule if provided
         effective_sigmas = sigmas
         if effective_sigmas is not None:
-            sampled=self._call_core_sampler(
-                model,final_seed,steps,cfg,sampler_name,scheduler,
-        positive,negative,latent_in,denoise,noise_mask=nm,disable_noise=None,
-                sigmas=effective_sigmas
+            sampled = self._call_core_sampler(
+                model,
+                final_seed,
+                steps,
+                cfg,
+                sampler_name,
+                scheduler,
+                positive,
+                negative,
+                latent_in,
+                denoise,
+                noise_mask=nm,
+                disable_noise=None,
+                sigmas=effective_sigmas,
             )
         else:
-            sampled=self._call_core_sampler(
-                model,final_seed,steps,cfg,sampler_name,scheduler,
-        positive,negative,latent_in,denoise,noise_mask=nm
+            sampled = self._call_core_sampler(
+                model,
+                final_seed,
+                steps,
+                cfg,
+                sampler_name,
+                scheduler,
+                positive,
+                negative,
+                latent_in,
+                denoise,
+                noise_mask=nm,
             )
-        return (sampled,model,positive,negative)
+
+        # Strongly protect unmasked area: optional color-match near edges, then re-blend original latent back into (1 - mask)
+        try:
+            if isinstance(nm, torch.Tensor):
+                s = sampled["samples"] if isinstance(sampled, dict) else getattr(sampled, "samples", None)
+                if s is not None and isinstance(s, torch.Tensor):
+                    m = nm.to(device=s.device, dtype=s.dtype)
+                    # Optional mask feather in latent space
+                    if isinstance(edge_feather_px, (int, float)) and edge_feather_px and edge_feather_px > 0:
+                        m = self._soften_mask(m, k=int(edge_feather_px))
+                    if m.shape[1] != 1:
+                        m = m[:, :1, :, :]
+                    keep = 1.0 - m  # unmasked area
+                    # orig latent is in latent_in["samples"]
+                    x0 = latent_in.get("samples", None)
+                    if isinstance(x0, torch.Tensor):
+                        x0 = x0.to(device=s.device, dtype=s.dtype)
+                        # Optional edge color/tone harmonization inside masked area before final reblend
+                        if do_tone_match and tone_strength > 0.0:
+                            s_matched = self._match_edge_tone(s, x0, m)
+                            s = s * (1.0 - tone_strength) + s_matched * tone_strength
+                        s = s * m + x0 * keep
+                        if isinstance(sampled, dict):
+                            sampled["samples"] = s
+                        else:
+                            # if object-like, try attribute
+                            try:
+                                setattr(sampled, "samples", s)
+                            except Exception:
+                                sampled = {"samples": s}
+        except Exception:
+            pass
+        return (sampled, model, positive, negative)
 
 
 
