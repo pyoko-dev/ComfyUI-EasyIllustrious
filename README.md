@@ -208,6 +208,78 @@ The suite includes automatic memory management:
 | IllustriousAttentionCouple | Attention Couple | Multi-concept attention coupling |
 | IllustriousAutoOutpaint | Auto Outpaint | Automated outpainting with soft-mask blending |
 
+### Smart Scene / Prompt Enhancements (v2.6)
+
+The Smart Scene Generator (IllustriousScenesPlus / Smart Prompt) now includes advanced quality and negative prompt controls:
+
+Quality Block Controls:
+
+- Use Quality Block: Toggle automatic high-quality prefix insertion.
+- Quality Block Text: Comma list of tokens (default: masterpiece, best quality, ultra-detailed, highres).
+- Quality Weight: Applies weighting (group or per-token depending on scheme).
+- Quality Weight Scheme:
+    - auto: Chooses grouped for ≤4 tokens, per-token otherwise.
+    - comfy: Grouped weighting (final token annotated) unless Per-Token toggle is on.
+    - A1111: Always per-token (token:weight) style.
+- Per-Token Quality Weights: Force per-token weighting regardless of scheme.
+
+Subject / Upscale Ordering:
+
+- Upscale Tags: Inserts additional resolution/detail tokens with token-budget aware pruning.
+- Subject Fallback: Baseline subject tokens if not already present (e.g., 1girl, solo).
+- Subject Fallback Order: Choose placement before or after Upscale Tags.
+
+Negative Prompt System:
+
+- Negative Preset: standard | aggressive | anime_clean | photoreal | custom.
+- Custom Negative Preset: Provide your own comma-separated string when preset = custom.
+- Generate Negative Output: Enables second output port for negative prompt.
+
+Pruning Metadata:
+
+- Metadata JSON now reports pruning decisions for upscale tokens (`pruning.upscale_original`, `pruning.upscale_final`, `pruning.dropped`, `pruning.pruned`).
+- Quality block configuration and whether it was pre-existing are recorded under `quality_block`.
+
+Example Quality Configurations:
+
+1. Classic grouped (comfy): `(masterpiece, best quality, ultra-detailed, highres:1.2)`
+2. Per-token A1111 style: `(masterpiece:1.2), (best quality:1.2), (ultra-detailed:1.2), (highres:1.2)`
+3. Forced per-token in comfy: Enable Per-Token Quality Weights with scheme = comfy.
+
+Token Budget Awareness:
+
+- If a mapped token count (e.g. 77 → ~320 chars) is selected, upscale tag list is pruned if adding them would exceed ~105% of the soft character cap.
+- Absolute Token Count: When you pick a specific Token Count (e.g. 150, 250) the generator now enforces exactly that number of comma-separated tokens by truncating overflow or appending neutral quality/detail fillers. Metadata block `token_enforcement` records additions or truncations.
+
+Returned Metadata (excerpt):
+
+```jsonc
+{
+    "quality_block": {
+        "enabled": true,
+        "tokens": ["masterpiece", "best quality", "ultra-detailed", "highres"],
+        "weight": 1.2,
+        "scheme": "auto",
+        "forced_per_token": false,
+        "present_preexisting": false
+    },
+    "pruning": {
+        "upscale_original": ["8k", "ultra-detailed", "extremely detailed"],
+        "upscale_final": ["8k", "ultra-detailed"],
+        "pruned": true,
+        "dropped": ["extremely detailed"]
+    },
+    "subject_fallback": {"value": "1girl, solo", "order": "after_upscale"}
+}
+```
+
+Upgrade Notes:
+
+- Existing workflows continue to work; defaults replicate previous behavior.
+- To disable the quality block entirely, set Use Quality Block = False.
+- For purely manual quality handling, disable both quality block and upscale tags.
+
+
 ## API Reference
 
 ### Search System

@@ -258,12 +258,37 @@ class IllustriousSmartSceneGenerator:
                     {"default": "none", "tooltip": "Prepend additional high-resolution/upscale tags after quality block."},
                 ),
                 "Negative Preset": (
-                    ["none", "standard", "aggressive", "anime_clean", "photoreal"],
-                    {"default": "none", "tooltip": "Generate a negative prompt using a curated preset."},
+                    ["none", "standard", "aggressive", "anime_clean", "photoreal", "custom"],
+                    {"default": "none", "tooltip": "Generate a negative prompt using a curated or custom preset."},
                 ),
                 "Generate Negative Output": (
                     "BOOLEAN",
                     {"default": False, "tooltip": "If true, second output returns the negative prompt string."},
+                ),
+                # Quality block controls
+                "Use Quality Block": (
+                    "BOOLEAN",
+                    {"default": True, "tooltip": "Automatically prepend a quality/emphasis block unless already present."},
+                ),
+                "Quality Block Text": (
+                    "STRING",
+                    {"default": "masterpiece, best quality, ultra-detailed, highres", "multiline": False, "tooltip": "Comma separated quality tokens. Will be auto-weighted if enabled."},
+                ),
+                "Quality Weight": (
+                    "FLOAT",
+                    {"default": 1.2, "min": 0.1, "max": 2.5, "step": 0.05, "tooltip": "Weight applied per token or to group depending on scheme."},
+                ),
+                "Quality Weight Scheme": (
+                    ["auto", "comfy", "A1111"],
+                    {"default": "auto", "tooltip": "How to format weighted quality tokens (grouped vs per-token)."},
+                ),
+                "Per-Token Quality Weights": (
+                    "BOOLEAN",
+                    {"default": False, "tooltip": "Force apply weight to every quality token even in comfy/auto grouped modes."},
+                ),
+                "Subject Fallback Order": (
+                    ["after_upscale", "before_upscale"],
+                    {"default": "after_upscale", "tooltip": "Choose whether subject fallback tokens are inserted before or after Upscale Tags."},
                 ),
             },
             "optional": {
@@ -300,13 +325,17 @@ class IllustriousSmartSceneGenerator:
                         "tooltip": "Comma-separated terms to downweight/remove",
                     },
                 ),
+                "Custom Negative Preset": (
+                    "STRING",
+                    {"forceInput": False, "tooltip": "If Negative Preset is 'custom', use this string as the negative prompt."},
+                ),
             },
         }
 
     RETURN_TYPES = ("STRING", "STRING", "STRING")
     RETURN_NAMES = ("prompt", "negative", "metadata")
     FUNCTION = "generate_smart_prompt"
-    CATEGORY = "Illustrious/🎭 Smart Scene Generation"
+    CATEGORY = "Easy Illustrious / Generators"
 
     def generate_smart_prompt(self, **kwargs) -> Tuple[str, str]:
         start_time = time.time()
@@ -320,18 +349,47 @@ class IllustriousSmartSceneGenerator:
             else:
                 prompt = str(result)
 
-            # User requested style: prepend high-quality weighted block like
-            # (masterpiece, best quality, ultra-detailed, highres:1.2)
-            # We'll allow override via optional inputs later; for now inject if not already present.
-
-            quality_block = "(masterpiece, best quality, ultra-detailed, highres:1.2)"
-            # Detect if user already supplied a quality block (rough heuristic)
-            q_present = False
+            # --- Quality Block Configuration ---
+            use_quality_block = bool(kwargs.get("Use Quality Block", True))
+            qb_tokens_raw = kwargs.get("Quality Block Text", "masterpiece, best quality, ultra-detailed, highres") or ""
+            quality_weight = float(kwargs.get("Quality Weight", 1.2) or 1.2)
+            quality_scheme = kwargs.get("Quality Weight Scheme", "auto") or "auto"
+            qb_tokens = [t.strip() for t in qb_tokens_raw.split(",") if t.strip()]
+            per_token_force = bool(kwargs.get("Per-Token Quality Weights", False))
+            # Detect if user already has any of the quality tokens (case-insensitive) present
             base_lower = (prompt or "").lower()
-            for token in ["masterpiece", "best quality", "ultra-detailed", "highres"]:
-                if token in base_lower:
-                    q_present = True
-                    break
+            q_present = any(t.lower() in base_lower for t in qb_tokens) if qb_tokens else False
+
+            def build_quality_block(tokens: List[str]) -> str:
+                if not tokens:
+                    return ""
+                # Apply weighting only if weight != 1.0
+                if per_token_force:
+                    scheme = "per"
+                else:
+                    if quality_scheme == "auto":
+                        # Heuristic: if len tokens > 4 use per-token for readability else grouped
+                        scheme = "per" if len(tokens) > 4 else "group"
+                    elif quality_scheme.lower() == "a1111":
+                        scheme = "per"
+                    else:  # comfy
+                        scheme = "group"
+                if quality_weight == 1.0:
+                    if scheme == "group":
+                        return f"({', '.join(tokens)})"
+                    else:
+                        return ", ".join(f"({t})" for t in tokens)
+                if scheme == "group":
+                    # Attach weight to final token (common comfy convention)
+                    if tokens:
+                        tokens_mod = tokens[:-1] + [f"{tokens[-1]}:{quality_weight:.2f}"]
+                    else:
+                        tokens_mod = []
+                    return f"({', '.join(tokens_mod)})"
+                else:  # per-token weighting (A1111 style)
+                    return ", ".join(f"({t}:{quality_weight:.2f})" for t in tokens)
+
+            quality_block = build_quality_block(qb_tokens) if use_quality_block else ""
 
             tipo_enabled = kwargs.get("Enable TIPO Optimization", True)
             tipo_meta = {}
@@ -359,12 +417,11 @@ class IllustriousSmartSceneGenerator:
                 )
 
             # Re-check presence after optimization (it may have reordered tokens)
-            if not q_present:
+            if not q_present and qb_tokens:
                 pl = (prompt or "").lower()
-                if any(t in pl for t in ["masterpiece", "best quality", "ultra-detailed", "highres"]):
+                if any(t.lower() in pl for t in qb_tokens):
                     q_present = True
-            if strict_tags_flag and not q_present:
-                # Prepend quality block, ensuring proper comma separation
+            if strict_tags_flag and use_quality_block and quality_block and not q_present:
                 prompt = f"{quality_block}, {prompt}" if prompt else quality_block
 
             # Inject Upscale Tags (after quality block) if selected
@@ -375,11 +432,22 @@ class IllustriousSmartSceneGenerator:
                 "photo_8k": ["RAW photo", "8k", "highres", "ultra-detailed"],
             }
             upscale_choice = kwargs.get("Upscale Tags", "none")
+            pruning_meta = {"upscale_original": [], "upscale_final": [], "pruned": False, "dropped": []}
             if strict_tags_flag and upscale_choice in upscale_map and upscale_choice != "none":
-                up_tokens = [t for t in upscale_map[upscale_choice] if t.lower() not in (prompt.lower() if prompt else "")]
+                current_lower = (prompt or "").lower()
+                up_tokens_all = [t for t in upscale_map[upscale_choice]]
+                up_tokens = [t for t in up_tokens_all if t.lower() not in current_lower]
+                pruning_meta["upscale_original"] = up_tokens_all
+                if mapped_cap and up_tokens:
+                    base_len = len(prompt)
+                    # Progressive pruning
+                    while len(up_tokens) > 1 and (base_len + len(", ".join(up_tokens)) > mapped_cap * 1.05):
+                        dropped = up_tokens.pop()  # drop last
+                        pruning_meta["dropped"].append(dropped)
+                        pruning_meta["pruned"] = True
                 if up_tokens:
-                    if prompt.startswith(quality_block):
-                        # Split off existing prefix
+                    pruning_meta["upscale_final"] = up_tokens[:]
+                    if quality_block and prompt.startswith(quality_block):
                         rest = prompt[len(quality_block):].lstrip(", ")
                         prompt = f"{quality_block}, {', '.join(up_tokens)}" + (f", {rest}" if rest else "")
                     else:
@@ -387,18 +455,24 @@ class IllustriousSmartSceneGenerator:
 
             # Subject fallback injection (only if person description absent and tokens missing)
             subj_fb = kwargs.get("Subject Fallback", "none")
+            subj_order = kwargs.get("Subject Fallback Order", "after_upscale")
             if strict_tags_flag and subj_fb and subj_fb != "none":
                 fb_tokens = [t.strip() for t in subj_fb.split(",") if t.strip()]
                 lower_prompt = (prompt or "").lower()
                 inject = [t for t in fb_tokens if t.lower() not in lower_prompt]
                 if inject:
-                    # Add after quality block & upscale tags
-                    if prompt.startswith(quality_block):
-                        # find after quality block
-                        after = prompt[len(quality_block):].lstrip(", ")
-                        prompt = f"{quality_block}, {', '.join(inject)}" + (f", {after}" if after else "")
+                    # Placement: before_upscale means insert right after quality block (before any upscale tokens we may have injected)
+                    if subj_order == "before_upscale" and quality_block and prompt.startswith(quality_block):
+                        # Separate quality block then reassemble with subject tokens placed immediately after
+                        remainder = prompt[len(quality_block):].lstrip(", ")
+                        prompt = f"{quality_block}, {', '.join(inject)}" + (f", {remainder}" if remainder else "")
                     else:
-                        prompt = ", ".join(inject + ([prompt] if prompt else []))
+                        # Default (after_upscale) or no quality block present -> standard logic
+                        if quality_block and prompt.startswith(quality_block):
+                            after = prompt[len(quality_block):].lstrip(", ")
+                            prompt = f"{quality_block}, {', '.join(inject)}" + (f", {after}" if after else "")
+                        else:
+                            prompt = ", ".join(inject + ([prompt] if prompt else []))
 
             # Optionally augment with an explicit Emotion/Expression (if provided)
             emotion = kwargs.get("Emotion/Expression", "-")
@@ -426,7 +500,7 @@ class IllustriousSmartSceneGenerator:
             # If Danbooru tag style is ON we should not destroy the weighted parentheses block.
             # We'll temporarily remove the quality block, format remaining tags, then restore it.
             if kwargs.get("Danbooru Tag Style", True) and strict_tags_flag:
-                if prompt.startswith(quality_block):
+                if quality_block and prompt.startswith(quality_block):
                     rest = prompt[len(quality_block):].lstrip(", ")
                     rest_fmt = self._format_danbooru_tags(rest)
                     prompt = f"{quality_block}, {rest_fmt}" if rest_fmt else quality_block
@@ -437,43 +511,113 @@ class IllustriousSmartSceneGenerator:
             neg_preset = kwargs.get("Negative Preset", "none")
             negative_prompt = ""
             if neg_preset and neg_preset != "none":
-                neg_map = {
-                    "standard": [
-                        "(worst quality:1.2)", "(low quality:1.2)", "(normal quality:1.2)",
-                        "lowres", "bad anatomy", "bad hands", "text", "error", "extra digits",
-                        "fewer digits", "cropped", "blurry", "jpeg artifacts", "signature", "watermark",
-                        "username", "artist name",
-                    ],
-                    "aggressive": [
-                        "(worst quality:1.3)", "(low quality:1.3)", "(normal quality:1.3)",
-                        "lowres", "bad anatomy", "bad hands", "text", "error", "extra digits", "fewer digits",
-                        "cropped", "blurry", "jpeg artifacts", "signature", "watermark", "username",
-                        "artist name", "deformed", "mutated", "long neck", "long body", "bad proportions",
-                        "poorly drawn face", "poorly drawn hands",
-                    ],
-                    "anime_clean": [
-                        "(worst quality:1.2)", "(low quality:1.2)", "(normal quality:1.2)",
-                        "lowres", "bad anatomy", "bad hands", "text", "error", "extra digits",
-                        "fewer digits", "blurry", "jpeg artifacts", "signature", "watermark", "nsfw",
-                    ],
-                    "photoreal": [
-                        "(worst quality:1.2)", "(low quality:1.2)", "(normal quality:1.2)",
-                        "lowres", "bad anatomy", "bad hands", "text", "error", "extra digits", "fewer digits",
-                        "cropped", "blurry", "jpeg artifacts", "signature", "watermark", "unnatural skin",
-                        "overprocessed", "grain", "deformed", "mutated",
-                    ],
-                }
-                toks = neg_map.get(neg_preset, [])
-                # Dedupe + join
-                seen = set()
-                deduped = []
-                for t in toks:
-                    k = t.lower()
-                    if k not in seen:
-                        seen.add(k)
-                        deduped.append(t)
-                negative_prompt = ", ".join(deduped)
+                if neg_preset == "custom":
+                    negative_prompt = kwargs.get("Custom Negative Preset", "") or ""
+                else:
+                    neg_map = {
+                        "standard": [
+                            "(worst quality:1.2)", "(low quality:1.2)", "(normal quality:1.2)",
+                            "lowres", "bad anatomy", "bad hands", "text", "error", "extra digits",
+                            "fewer digits", "cropped", "blurry", "jpeg artifacts", "signature", "watermark",
+                            "username", "artist name",
+                        ],
+                        "aggressive": [
+                            "(worst quality:1.3)", "(low quality:1.3)", "(normal quality:1.3)",
+                            "lowres", "bad anatomy", "bad hands", "text", "error", "extra digits", "fewer digits",
+                            "cropped", "blurry", "jpeg artifacts", "signature", "watermark", "username",
+                            "artist name", "deformed", "mutated", "long neck", "long body", "bad proportions",
+                            "poorly drawn face", "poorly drawn hands",
+                        ],
+                        "anime_clean": [
+                            "(worst quality:1.2)", "(low quality:1.2)", "(normal quality:1.2)",
+                            "lowres", "bad anatomy", "bad hands", "text", "error", "extra digits",
+                            "fewer digits", "blurry", "jpeg artifacts", "signature", "watermark", "nsfw",
+                        ],
+                        "photoreal": [
+                            "(worst quality:1.2)", "(low quality:1.2)", "(normal quality:1.2)",
+                            "lowres", "bad anatomy", "bad hands", "text", "error", "extra digits", "fewer digits",
+                            "cropped", "blurry", "jpeg artifacts", "signature", "watermark", "unnatural skin",
+                            "overprocessed", "grain", "deformed", "mutated",
+                        ],
+                    }
+                    toks = neg_map.get(neg_preset, [])
+                    # Dedupe + join
+                    seen = set()
+                    deduped = []
+                    for t in toks:
+                        k = t.lower()
+                        if k not in seen:
+                            seen.add(k)
+                            deduped.append(t)
+                    negative_prompt = ", ".join(deduped)
             gen_neg_out = bool(kwargs.get("Generate Negative Output", False))
+
+            # ---- Absolute Token Count Enforcement ----
+            token_target_meta = {}
+            token_count_sel_int = None
+            try:
+                if token_count_sel and token_count_sel.isdigit():
+                    token_count_sel_int = int(token_count_sel)
+            except Exception:
+                token_count_sel_int = None
+
+            def _split_tokens(s: str) -> List[str]:
+                return [t.strip() for t in (s or "").split(",") if t.strip()]
+
+            def _rebuild_from_tokens(tokens: List[str]) -> str:
+                return ", ".join(tokens)
+
+            if token_count_sel_int and token_count_sel_int > 0:
+                # Enforce after all structural insertions (and after Danbooru formatting if used) to reflect final output tokens.
+                # If Danbooru style is ON, re-run formatting prior to enforcement to maintain style.
+                enforce_after_format = kwargs.get("Danbooru Tag Style", True) and strict_tags_flag
+                if enforce_after_format:
+                    # Already formatted earlier if style on; no action needed here.
+                    pass
+                original_tokens = _split_tokens(prompt)
+                original_len = len(original_tokens)
+                target = token_count_sel_int
+                added = []
+                truncated = []
+                if original_len > target:
+                    truncated = original_tokens[target:]
+                    working = original_tokens[:target]
+                elif original_len < target:
+                    working = original_tokens[:]
+                    # Build a filler pool from flavor boosts + ambience + generic detail terms
+                    filler_pool = set([
+                        "detailed", "finely detailed", "crisp lines", "balanced colors", "clean lineart",
+                        "dynamic lighting", "dramatic lighting", "soft lighting", "atmospheric depth",
+                        "subtle shading", "volumetric light", "color harmony", "sharp focus",
+                    ])
+                    # Extend pool with flavor boosts heuristically
+                    for fb_list in [
+                        ["vibrant colors", "high saturation control", "dynamic lighting"],
+                        ["soft lighting", "pastel tones", "gentle shading"],
+                        ["natural color grading", "realistic lighting", "neutral tones"],
+                    ]:
+                        filler_pool.update(fb_list)
+                    lower_existing = set(t.lower() for t in working)
+                    for f in list(filler_pool):
+                        if len(working) >= target:
+                            break
+                        if f.lower() not in lower_existing:
+                            working.append(f)
+                            added.append(f)
+                            lower_existing.add(f.lower())
+                else:
+                    working = original_tokens
+                prompt = _rebuild_from_tokens(working)
+                token_target_meta = {
+                    "enabled": True,
+                    "target": target,
+                    "original_length": original_len,
+                    "final_length": len(working),
+                    "added": added,
+                    "truncated": truncated,
+                }
+            else:
+                token_target_meta = {"enabled": False}
 
             # Generate comprehensive metadata
             generation_time = time.time() - start_time
@@ -481,7 +625,7 @@ class IllustriousSmartSceneGenerator:
 
             metadata = {
                 "generator": "Illustrious Smart Scene Generator",
-                "version": "2.4 - Quality/Subject/Upscale + Neg Helper",
+                "version": "2.7 - Absolute Token Count Enforcement",
                 "system": "Anime Scene Vocabulary System + Anime Composition System",
                 "category": category,
                 "complexity": kwargs.get("Complexity", "medium"),
@@ -545,6 +689,20 @@ class IllustriousSmartSceneGenerator:
                     "preset": neg_preset,
                     "prompt": negative_prompt,
                 },
+                "quality_block": {
+                    "enabled": use_quality_block,
+                    "tokens": qb_tokens,
+                    "weight": quality_weight,
+                    "scheme": quality_scheme,
+                    "forced_per_token": per_token_force,
+                    "present_preexisting": q_present,
+                },
+                "pruning": pruning_meta,
+                "subject_fallback": {
+                    "value": subj_fb,
+                    "order": subj_order,
+                },
+                "token_enforcement": token_target_meta,
             }
 
             # Update statistics

@@ -24,6 +24,7 @@ from .src.core import anime_scene_system as _anime
 from .src.nodes.color_suite import IllustriousColorSuite
 from .src.nodes.auto_outpaint import IllustriousAutoOutpaint
 from .src.nodes.emotions import IllustriousEmotions
+from .src.nodes.smart_prompt_generator import IllustriousSmartSceneGenerator
 # Import smart cache server module to register routes (side effects only)
 from .src.nodes import smart_cache_server as _ill_smart_cache_routes  # noqa: F401
 
@@ -97,6 +98,7 @@ NODE_CLASS_MAPPINGS = {
     "IllustriousScenesPlus": IllustriousScenesPlusEngine,
     "IllustriousAttentionCouple": IllustriousAttentionCouple,
     "IllustriousAutoOutpaint": IllustriousAutoOutpaint,
+    "IllustriousSmartSceneGenerator": IllustriousSmartSceneGenerator,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
