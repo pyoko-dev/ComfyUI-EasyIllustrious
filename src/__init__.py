@@ -2192,6 +2192,13 @@ class IllustriousHairstyles:
                         "tooltip": "Will format the tag using \\( and \\)",
                     },
                 ),
+                "Output Format": (
+                    ["Tags (comma)", "Tags (space)", "Phrase"],
+                    {
+                        "default": "Tags (comma)",
+                        "tooltip": "How to format the hairstyle: comma-separated tags, space-separated tags, or a short phrase.",
+                    },
+                ),
             },
         }
 
@@ -2213,6 +2220,7 @@ class IllustriousHairstyles:
         hairstyle = kwargs.get("Hairstyles", "-")
         inject_styles = kwargs.get("Inject Styles", True)
         format_tag = kwargs.get("Format Tag", False)
+        output_format = kwargs.get("Output Format", "Tags (comma)")
 
         # Filter valid components and construct the sentence
         components = [
@@ -2221,7 +2229,17 @@ class IllustriousHairstyles:
             haircut if haircut != "-" else "",
             hairstyle if hairstyle != "-" else "",
         ]
-        tag_phrase = " ".join(filter(None, components)).strip()
+
+        # Build according to desired output format
+        if output_format == "Tags (space)":
+            tag_phrase = " ".join(filter(None, components)).strip()
+        elif output_format == "Phrase":
+            tag_phrase = self._build_hairstyle_phrase(haircolors, length_volume, haircut, hairstyle).strip()
+            # Fallback if phrase couldn't be built meaningfully
+            if not tag_phrase:
+                tag_phrase = ", ".join([c for c in components if c]).strip()
+        else:  # Tags (comma)
+            tag_phrase = ", ".join([c for c in components if c]).strip()
 
         if not tag_phrase or not inject_styles:
             return (f"{prefix} {suffix}".strip(),)
@@ -2242,6 +2260,60 @@ class IllustriousHairstyles:
         # Cleanup stray spaces before commas
         prompt = prompt.replace(" ,", ",")
         return (prompt,)
+
+    @staticmethod
+    def _strip_suffix(text: str, suffix: str) -> str:
+        return text[:-len(suffix)] if text.endswith(suffix) else text
+
+    def _build_hairstyle_phrase(
+        self,
+        haircolors: str,
+        length_volume: str,
+        haircut: str,
+        hairstyle: str,
+    ) -> str:
+        """Create a small, readable hairstyle phrase like 'long brown hair with twin braids'.
+        Falls back to simple joining if insufficient parts are provided.
+        """
+        parts = []
+
+        color_adj = ""
+        length_adj = ""
+
+        if haircolors and haircolors != "-":
+            # convert 'brown hair' -> 'brown', but keep complex items as-is
+            if haircolors.endswith(" hair"):
+                color_adj = self._strip_suffix(haircolors, " hair")
+            else:
+                color_adj = haircolors
+
+        if length_volume and length_volume != "-":
+            if length_volume.endswith(" hair"):
+                length_adj = self._strip_suffix(length_volume, " hair")
+            else:
+                length_adj = length_volume
+
+        base = "".join([
+            f"{length_adj} " if length_adj else "",
+            f"{color_adj} " if color_adj else "",
+        ]).strip()
+
+        phrase = ""
+        if base:
+            phrase = f"{base} hair"
+        # Append haircut and/or hairstyle in a simple readable way
+        tail_bits = []
+        if haircut and haircut != "-":
+            tail_bits.append(f"styled as {haircut}")
+        if hairstyle and hairstyle != "-":
+            tail_bits.append(f"with {hairstyle}")
+
+        if phrase and tail_bits:
+            phrase = f"{phrase} {', '.join(tail_bits)}"
+        elif not phrase and tail_bits:
+            phrase = ", ".join(tail_bits)
+
+        return phrase
 
     def inject_hairstyle_smartly(
         self, prefix: str, hairstyle_sentence: str, suffix: str
