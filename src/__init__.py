@@ -2207,32 +2207,40 @@ class IllustriousHairstyles:
         suffix = kwargs.get("suffix", "").strip()
 
         # Get hairstyle components
+        length_volume = kwargs.get("Length and Volume", "-")
         haircolors = kwargs.get("Hair Colors", "-")
         haircut = kwargs.get("Haircuts", "-")
         hairstyle = kwargs.get("Hairstyles", "-")
         inject_styles = kwargs.get("Inject Styles", True)
+        format_tag = kwargs.get("Format Tag", False)
 
         # Filter valid components and construct the sentence
         components = [
             haircolors if haircolors != "-" else "",
+            length_volume if length_volume != "-" else "",
             haircut if haircut != "-" else "",
             hairstyle if hairstyle != "-" else "",
         ]
-        sentence = " ".join(filter(None, components)).strip()
+        tag_phrase = " ".join(filter(None, components)).strip()
 
-        if not sentence or not inject_styles:
+        if not tag_phrase or not inject_styles:
             return (f"{prefix} {suffix}".strip(),)
 
-        # Add a space at the start and a comma at the end
-        sentence = f" {sentence}," if sentence else ""
+        # Build the hairstyle sentence (leading space + trailing comma), with optional tag formatting
+        if format_tag:
+            hairstyle_sentence = f" \\({tag_phrase}\\),"
+        else:
+            hairstyle_sentence = f" {tag_phrase},"
 
         # Smart injection: Place hairstyle after hair color and before camera/framing terms
         if prefix:
-            prompt = self.inject_hairstyle_smartly(prefix, sentence, suffix)
+            prompt = self.inject_hairstyle_smartly(prefix, hairstyle_sentence, suffix)
         else:
             # No prefix case
-            prompt = f"{sentence} {suffix}".strip()
+            prompt = f"{hairstyle_sentence} {suffix}".strip()
 
+        # Cleanup stray spaces before commas
+        prompt = prompt.replace(" ,", ",")
         return (prompt,)
 
     def inject_hairstyle_smartly(
